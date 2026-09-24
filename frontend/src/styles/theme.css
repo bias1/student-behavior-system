@@ -1,0 +1,134 @@
+/**
+ * 深色大屏主题变量与通用样式
+ * 设计基线 1920×1080：字号用 clamp() 在小屏等比收缩，避免 1366 笔记本上直接溢出。
+ * Element Plus 的深色由 <html class="dark"> + 官方 css-vars 提供，这里只覆盖项目自有外观。
+ */
+
+:root {
+  --sb-bg-0: #050d1f;
+  --sb-bg-1: #0a1730;
+  --sb-panel: rgba(13, 30, 56, 0.72);
+  --sb-panel-border: rgba(64, 128, 200, 0.22);
+  --sb-text: #dcecff;
+  --sb-text-dim: #8fabc9;
+  --sb-accent: #37e2f0;
+  --sb-blue: #4ea1ff;
+  --sb-yellow: #ffd166;
+  --sb-red: #ff6b81;
+  --sb-green: #7ee787;
+  --sb-shadow: 0 2px 18px rgba(0, 0, 0, 0.45);
+  --sb-radius: 10px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Microsoft YaHei', 'PingFang SC', 'Helvetica Neue', Arial, sans-serif;
+  color: var(--sb-text);
+  /* 渐变底 + 顶部微光，比纯黑更接近答辩现场的大屏观感 */
+  background: radial-gradient(1200px 600px at 20% -10%, rgba(41, 92, 168, 0.35), transparent 60%),
+    linear-gradient(160deg, var(--sb-bg-0) 0%, var(--sb-bg-1) 60%, #061024 100%);
+  background-attachment: fixed;
+  overflow-x: hidden;
+}
+
+/* 细滚动条：大屏表格横向滚动时不抢视线 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(90, 140, 200, 0.45);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------- 通用面板 ---------- */
+.sb-panel {
+  position: relative;
+  background: var(--sb-panel);
+  border: 1px solid var(--sb-panel-border);
+  border-radius: var(--sb-radius);
+  box-shadow: var(--sb-shadow);
+  overflow: hidden;
+}
+
+.sb-panel__title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  font-size: clamp(13px, 0.85vw, 17px);
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--sb-text);
+  border-bottom: 1px solid rgba(64, 128, 200, 0.16);
+}
+
+/* 标题左侧的霓虹短条：大屏视觉锚点 */
+.sb-panel__title::before {
+  content: '';
+  width: 4px;
+  height: 14px;
+  margin-right: 8px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--sb-accent), var(--sb-blue));
+  box-shadow: 0 0 8px var(--sb-accent);
+}
+
+.sb-panel__title > span:first-child {
+  flex: 1;
+}
+
+.sb-panel__body {
+  padding: 6px 10px 10px;
+}
+
+.sb-muted {
+  color: var(--sb-text-dim);
+  font-size: 12px;
+}
+
+/* 数字用等宽字形，避免刷新时宽度跳动 */
+.sb-num {
+  font-family: 'DIN Alternate', 'Bahnschrift', Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Element Plus 局部深色适配 ---------- */
+.el-table {
+  --el-table-border-color: rgba(64, 128, 200, 0.16);
+  --el-table-bg-color: transparent;
+  --el-table-tr-bg-color: transparent;
+  --el-table-header-bg-color: rgba(20, 45, 82, 0.8);
+  --el-table-row-hover-bg-color: rgba(55, 226, 240, 0.08);
+  background: transparent;
+}
+
+.el-table th.el-table__cell {
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.el-drawer,
+.el-dialog {
+  --el-bg-color: #0b1a33;
+}
+
+.page {
+  padding: 16px 22px 24px;
+  min-height: 100%;
+}

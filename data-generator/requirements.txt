@@ -1,0 +1,5 @@
+# 数据模拟模块依赖（后端与共享依赖见 backend/requirements.txt）
+numpy>=1.24
+Faker>=20.0
+PyMySQL>=1.1
+SQLAlchemy>=2.0        # 后端 ORM 复用；本脚本入库走 PyMySQL 批量通道
