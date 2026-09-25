@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 from flask import Blueprint, request
 from sqlalchemy import text
+from sqlalchemy.orm import joinedload
 
 from analysis import clustering
 from models import Student, Warning, db
@@ -87,6 +88,7 @@ def student_list():
     """学生检索：支持学号精确/姓名前缀/学院筛选，个体画像页的搜索框数据源"""
     keyword = (request.args.get("keyword") or "").strip()
     college = request.args.get("college")
+    with_stats = request.args.get("with_stats") == "1"
     page, size = parse_int("page", 1, 1, 10000), parse_int("size", 20, 1, 200)
 
     q = Student.query
@@ -98,8 +100,48 @@ def student_list():
         q = q.filter(Student.college == college)
     total = q.count()
     rows = q.order_by(Student.student_id).offset((page - 1) * size).limit(size).all()
-    return ok({"total": total, "page": page, "size": size,
-               "items": [s.to_dict() for s in rows]})
+    items = [s.to_dict() for s in rows]
+
+    if with_stats and items:
+        # 批量取预警统计：单次 GROUP BY 子查询，不逐行查
+        sids = [s["student_id"] for s in items]
+        start, end, _ = resolve_window()
+
+        # IN 子句展开：使用 expanding bindparam，安全无注入
+        from sqlalchemy import bindparam
+        warn_sql = text("""
+            SELECT student_id, COUNT(*) pending_warnings
+            FROM warning
+            WHERE status = 0 AND student_id IN :sids
+            GROUP BY student_id
+        """).bindparams(bindparam("sids", expanding=True))
+        warn_rows = pd.read_sql(warn_sql, con=db.engine, params={"sids": sids})
+        warn_map = dict(zip(warn_rows["student_id"], warn_rows["pending_warnings"].astype(int)))
+
+        # 窗口内活跃天数（有消费 OR 有进馆）
+        active_sql = text("""
+            SELECT sid AS student_id, COUNT(DISTINCT d) active_days FROM (
+                SELECT student_id sid, DATE(consumed_at) d FROM consumption
+                WHERE is_valid = 1 AND student_id IN :sids
+                  AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+                UNION
+                SELECT student_id sid, DATE(gate_in_time) d FROM library_record
+                WHERE is_valid = 1 AND student_id IN :sids
+                  AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+            ) t GROUP BY sid
+        """).bindparams(bindparam("sids", expanding=True))
+        active_rows = pd.read_sql(
+            active_sql, con=db.engine,
+            params={"sids": sids, "start": start, "end": end},
+        )
+        active_map = dict(zip(active_rows["student_id"], active_rows["active_days"].astype(int)))
+
+        for item in items:
+            sid_val = item["student_id"]
+            item["pending_warnings"] = warn_map.get(sid_val, 0)
+            item["active_days"] = active_map.get(sid_val, 0)
+
+    return ok({"total": total, "page": page, "size": size, "items": items})
 
 
 @bp.get("/<sid>/profile")
@@ -185,6 +227,7 @@ def profile(sid: str):
     }
 
     warnings = (Warning.query.filter_by(student_id=sid)
+                .options(joinedload(Warning.student), joinedload(Warning.rule))
                 .order_by(Warning.warning_date.desc()).limit(20).all())
 
     return ok({

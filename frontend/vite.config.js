@@ -38,8 +38,8 @@ export default defineConfig(({ mode }) => {
       outDir: 'dist',
       chunkSizeWarningLimit: 1600,
       rollupOptions: {
-        // echarts 和 element-plus 体积大且不常改，单独切包利于浏览器缓存
-        output: { manualChunks: { echarts: ['echarts'], 'element-plus': ['element-plus'] } },
+        // echarts 体积大且不常改，单独切包利于浏览器缓存
+        output: { manualChunks: { echarts: ['echarts'] } },
       },
     },
   }

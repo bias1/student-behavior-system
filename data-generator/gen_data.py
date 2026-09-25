@@ -54,6 +54,10 @@ from typing import Dict, Iterable, List, Optional, TextIO, Tuple
 import numpy as np
 from faker import Faker
 
+from db_env import load_dotenv
+
+load_dotenv()          # 与后端读同一份 .env；main() 里的 argparse 默认值求值前必须完成
+
 try:
     import pymysql
 except ImportError:                                  # --dry-run 时允许不装 pymysql

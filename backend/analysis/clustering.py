@@ -155,6 +155,7 @@ def describe_cluster(z_row: pd.Series) -> str:
     return "、".join(parts[:3]) + tail
 
 _CACHE: Dict[int, Dict[str, Any]] = {}
+_FEAT_CACHE: Dict[tuple, Dict[str, Any]] = {}   # 特征表级缓存：同一窗口的聚类/手肘/群体均值共用
 _LOCK = threading.Lock()
 
 
@@ -213,12 +214,21 @@ def _fetch_daily(start: str, end: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.D
     return cons, lib, meal_std
 
 
-def build_features(start: str, end: str) -> pd.DataFrame:
+def build_features(start: str, end: str, use_cache: bool = True, ttl: int = 600) -> pd.DataFrame:
     """
     返回 index=student_id、columns=FEATURE_KEYS 的完整特征表（11 列）。
     分母统一用窗口天数 window_days，保证"没去吃饭/没去图书馆"这些缺失本身也是信号。
     需要子集时由调用方按 FEATURE_SETS 切片，不在这里做分支，保证两套特征数值一致。
+    结果按 (start, end) 做 TTL 缓存（只读约定，调用方只切片/聚合不改原表）：
+    个体画像一页会碰 fit_kmeans + group_summary 两次，审计发现"注释说复用缓存、
+    实际 group_summary 重新扫表"，缓存在这层补齐后两处天然同源。
     """
+    key = (start, end)
+    if use_cache:
+        with _LOCK:
+            hit = _FEAT_CACHE.get(key)
+            if hit and time.time() < hit["exp"]:
+                return hit["data"]
     cons, lib, meal_std = _fetch_daily(start, end)
     days = pd.read_sql(text("SELECT DATEDIFF(:end, :start) + 1 AS d"), con=db.engine,
                        params={"start": start, "end": end}).iloc[0]["d"]
@@ -278,6 +288,12 @@ def build_features(start: str, end: str) -> pd.DataFrame:
     for k in ["night_ratio", "meal_reg", "weekend_ratio", "library_days_ratio", "evening_study_ratio"]:
         f[k] = f[k] * 100
     f["amount_cv"] = f["amount_cv"] * 100
+    if use_cache:
+        with _LOCK:
+            _FEAT_CACHE[key] = {"data": f[FEATURE_KEYS], "exp": time.time() + ttl}
+            if len(_FEAT_CACHE) > 16:            # 防止历史窗口组合把内存撑爆
+                oldest = min(_FEAT_CACHE, key=lambda x: _FEAT_CACHE[x]["exp"])
+                _FEAT_CACHE.pop(oldest, None)
     return f[FEATURE_KEYS]
 
 
@@ -347,7 +363,7 @@ def fit_kmeans(start: str, end: str, k: int = 4, use_cache: bool = True,
             if hit and time.time() < hit["exp"]:
                 return hit["data"]
 
-    feat = build_features(start, end).loc[:, cols].dropna()
+    feat = build_features(start, end, use_cache=use_cache).loc[:, cols].dropna()
     if len(feat) < max(3, k):
         return {"error": "样本量不足以聚类", "n_students": int(len(feat)), "k": k,
                 "feature_set": feature_set}

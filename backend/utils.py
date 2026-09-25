@@ -88,7 +88,34 @@ def parse_int(name: str, default: int, min_val: int = 1, max_val: int = 100000) 
     return max(min_val, min(max_val, v))
 
 
+def parse_int_strict(name: str, allowed: tuple | list | None = None,
+                     bounds: tuple[int, int] | None = None) -> Tuple[Optional[int], Optional[str]]:
+    """
+    严格版 query 整数解析：缺省返回 (None, None)，非法返回 (None, 错误文案)。
+    与 parse_int 的分工：窗口天数这类"错了退回默认即可"的参数用 parse_int；
+    筛选条件这类"静默退回会误导调用方"的参数用本函数，把非法值显式拒成 400，
+    而不是让裸 int() 抛 ValueError 被全局处理器包成 500。
+    回显的用户输入截断到 40 字符，防止超长探测串塞进响应体。
+    """
+    from flask import request
+
+    raw = request.args.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None, None
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, f"参数 {name} 必须是整数，收到：{str(raw)[:40]}"
+    if allowed is not None and v not in allowed:
+        return None, f"参数 {name} 只能是 {'/'.join(map(str, allowed))}，收到：{v}"
+    if bounds is not None and not (bounds[0] <= v <= bounds[1]):
+        return None, f"参数 {name} 须在 {bounds[0]}~{bounds[1]} 范围内，收到：{v}"
+    return v, None
+
+
 def parse_date(name: str) -> Optional[dt.date]:
+    """query 日期解析：支持 3 种常见格式，非法/缺失返回 None。
+    调用方需要区分"没传"与"传错"时，先 request.args.get 判存在再判返回值"""
     from flask import request
 
     raw = request.args.get(name)
@@ -129,13 +156,23 @@ def resolve_window(default_days: int = 30) -> Tuple[str, str, int]:
       ?start=2026-05-01&end=2026-05-20  优先
       ?days=30                          从数据右界往回推
     返回 (start_str, end_str, 实际天数)，字符串便于直接作为 SQL 绑定参数。
+    非法的 start/end/days 直接 400（走 app.py 的统一 400 出口）：
+    静默回落默认窗口会让调用方误以为"查的是自己传的那段"，是审计里点名的坑。
     """
-    from flask import request
+    from flask import abort, request
+
+    for name in ("start", "end"):
+        raw = request.args.get(name)
+        if raw and parse_date(name) is None:
+            abort(400, f"参数 {name} 日期格式应为 YYYY-MM-DD，收到：{str(raw)[:40]}")
+    raw_days = request.args.get("days")
+    if raw_days and str(raw_days).strip().lstrip("-").isdigit() is False:
+        abort(400, f"参数 days 必须是整数，收到：{str(raw_days)[:40]}")
 
     d_start, d_end = data_range()          # 顺序不可写反：data_range 返回 (起, 止)
     start = parse_date("start") or (d_end - dt.timedelta(days=default_days - 1))
     end = parse_date("end") or d_end
-    if request.args.get("days") and not parse_date("start"):
+    if raw_days and not parse_date("start"):
         days = parse_int("days", default_days, 1, 3650)
         start = max(d_start, d_end - dt.timedelta(days=days - 1))
         end = d_end

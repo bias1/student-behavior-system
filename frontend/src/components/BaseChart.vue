@@ -4,7 +4,7 @@
  * 负责最容易出问题的三件事：初始化时机、尺寸自适应、销毁。
  * - 用 ResizeObserver 而不是 window.resize：面板宽度受栅格影响，父容器变化时才会真正需要重绘
  * - setOption 用 notMerge=true：切换特征集/指标时 series 数量会变，合并旧配置会残留上一次的线
- * - 主题名 'sb-dark' 在 src/plugins/echarts.js 里注册
+ * - 主题名 'insight-dark' 在 src/plugins/echarts.js 里注册
  */
 import { onBeforeUnmount, onMounted, shallowRef, ref, watch, nextTick } from 'vue'
 import echarts from '@/plugins/echarts'
@@ -20,7 +20,7 @@ const el = ref(null)
 const chart = shallowRef(null)   // shallowRef：实例不需要被 Vue 深度代理，否则内部遍历极慢还易报警
 let ro = null
 
-const LOPT = { text: '加载中', color: '#37e2f0', textColor: '#9fbadb', maskColor: 'rgba(6,16,32,0.35)' }
+const LOPT = { text: '加载中', color: '#4fd1ff', textColor: '#8b96a5', maskColor: 'rgba(11,15,20,0.55)' }
 
 function render() {
   if (!chart.value || !props.option) return
@@ -29,7 +29,7 @@ function render() {
 
 onMounted(async () => {
   await nextTick()
-  chart.value = echarts.init(el.value, 'sb-dark', { renderer: 'canvas' })
+  chart.value = echarts.init(el.value, 'insight-dark', { renderer: 'canvas' })
   chart.value.on('click', (p) => emit('click', p))
   render()
   ro = new ResizeObserver(() => chart.value && chart.value.resize())

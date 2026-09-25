@@ -87,6 +87,7 @@ def ensure_rules() -> int:
     把总纲四大规则补写进 warning_rule（存在则只补齐描述，不覆盖人工调过的阈值）。
     扫描入口每次调用，保证接口层拿得到配置；INSERT IGNORE 让它对已有配置完全无损。
     """
+    ext.ensure_snapshot_column()           # warning.rule_name 快照列自愈迁移（老库无需重建）
     rows = [{"code": code, **cfg} for code, cfg in SYLLABUS_RULES.items()]
     sql = text("""
         INSERT IGNORE INTO warning_rule (rule_code, rule_name, warning_type,
@@ -94,6 +95,10 @@ def ensure_rules() -> int:
         VALUES (:code, :rule_name, :warning_type, :threshold_value, :threshold_json,
                 :warning_level, :description)
         """)
+    # 历史口径校正：NIGHT_CONSUME 描述曾写"月内 ≥3 次"，实际实现是"分析窗口内累计"
+    # （文案与算法口径不一致是审计点名的问题）；只命中旧文案，不覆盖管理员改过的描述。
+    night_fix = text("UPDATE warning_rule SET description = :d"
+                     " WHERE rule_code = 'NIGHT_CONSUME' AND description LIKE '%月内%'")
     with db.engine.begin() as conn:
         res = conn.execute(sql, [{"code": r["code"], "rule_name": r["rule_name"],
                                   "warning_type": r["warning_type"],
@@ -101,6 +106,7 @@ def ensure_rules() -> int:
                                   "threshold_json": json.dumps(r["threshold_json"], ensure_ascii=False),
                                   "warning_level": r["warning_level"],
                                   "description": r["description"]} for r in rows])
+        conn.execute(night_fix, {"d": "23:00-05:00 时段消费在分析窗口内累计 ≥3 次"})
         return int(res.rowcount or 0)
 
 
@@ -370,13 +376,14 @@ def _persist(rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
     sql = text("""
-        INSERT INTO warning (student_id, rule_code, warning_type, warning_level, warning_date,
+        INSERT INTO warning (student_id, rule_code, rule_name, warning_type, warning_level, warning_date,
                              metric_value, detail_json, message, status)
-        VALUES (:student_id, :rule_code, :warning_type, :warning_level, :warning_date,
+        VALUES (:student_id, :rule_code, :rule_name, :warning_type, :warning_level, :warning_date,
                 :metric_value, :detail_json, :message, 0)
         ON DUPLICATE KEY UPDATE metric_value = VALUES(metric_value),
                                 message = VALUES(message),
                                 detail_json = VALUES(detail_json),
+                                rule_name = VALUES(rule_name),
                                 warning_level = VALUES(warning_level),
                                 warning_type = VALUES(warning_type)
         """)
@@ -423,6 +430,8 @@ def scan(start: str, end: str, rules: Optional[List[str]] = None,
             by_level[str(level)] = by_level.get(str(level), 0) + 1
             rows.append({
                 "student_id": h["student_id"], "rule_code": code,
+                # rule_name 随记快照：事后改名/停用不回溯历史预警的展示名（models.to_dict 优先读它）
+                "rule_name": cfg["rule_name"],
                 "warning_type": cfg["warning_type"],
                 "warning_level": level,
                 "warning_date": h["warning_date"], "metric_value": h.get("metric_value"),

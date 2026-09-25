@@ -12,6 +12,10 @@ import os
 
 import pymysql
 
+from db_env import load_dotenv
+
+load_dotenv()          # 与后端读同一份 .env，避免两处口令不一致
+
 DB = dict(host=os.getenv("DB_HOST", "127.0.0.1"), port=int(os.getenv("DB_PORT", "3306")),
           user=os.getenv("DB_USER", "root"), password=os.getenv("DB_PASSWORD", "123456"),
           database=os.getenv("DB_NAME", "student_behavior"), charset="utf8mb4")
@@ -62,10 +66,13 @@ CHECKS = [
      " FROM consumption WHERE is_valid=1 AND (HOUR(consumed_at)>=23 OR HOUR(consumed_at)<5)"
      " GROUP BY student_id ORDER BY n DESC LIMIT 5", lambda r: True),
 
+    # 基准日动态取全库最后进馆日：旧实现写死 '2026-05-30'，重新生成其它区间的数据后验证口径错位
     ("异常样本：长期不进馆学生（NO_LIBRARY 应可识别）", "SELECT s.student_id,"
      " MAX(DATE(l.gate_in_time)) last_in FROM student s LEFT JOIN library_record l"
      " ON l.student_id=s.student_id AND l.is_valid=1 GROUP BY s.student_id"
-     " HAVING last_in IS NULL OR DATEDIFF('2026-05-30', last_in)>=15 LIMIT 5", lambda r: True),
+     " HAVING last_in IS NULL OR DATEDIFF("
+     " (SELECT MAX(DATE(gate_in_time)) FROM library_record WHERE is_valid=1), last_in)>=15 LIMIT 5",
+     lambda r: True),
 ]
 
 EXPLAINS = [

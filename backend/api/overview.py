@@ -24,6 +24,17 @@ def get_overview():
     return ok(statistics.overview())
 
 
+@bp.get("/summary")
+def get_summary():
+    """
+    概览页汇总指标（包含环比/小泡图数据）。
+    ?days=N (默认 30)  从数据右界往回推 N 天
+    返回: active_rate / total_amount / warning_count / *_delta / spark_* 等
+    """
+    start, end, days = resolve_window()
+    return ok(statistics.summary_metrics(start, end, days))
+
+
 @bp.get("/groups")
 def get_groups():
     """

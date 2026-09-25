@@ -9,6 +9,8 @@ import { http } from './request'
 export const OverviewApi = {
   /** 指标卡：student_count / total_amount / avg_daily_study_minutes / warning_count / *_peak_hour */
   stats: (params) => http.get('/overview', params),
+  /** 汇总指标：含环比 *_delta / 小泡图 spark_* / active_rate，概览页 KPI 卡数据源 */
+  summary: (params) => http.get('/overview/summary', params),
   /** 元信息：date_start、date_end、merchant_types、warning_levels、warning_status、weekday_names */
   meta: () => http.get('/overview/meta'),
   /** 群体结构：dim = college | grade | major | gender → items[{name, students, avg_amount, ...}] */
@@ -85,12 +87,20 @@ export const WarningApi = {
   handle: (id, body) => http.post(`/warning/${id}/handle`, body),
 }
 
+/* ---------------- 认证 /api/auth（轻量登录守卫） ---------------- */
+export const AuthApi = {
+  /** 登录开关探测（匿名可访问）：enabled=false 时前端不拦路由 */
+  status: () => http.get('/auth/status', null, { silent: true }),
+  /** 登录：成功返回 {token, expires_in, username, role}，失败 401 */
+  login: (username, password) => http.post('/auth/login', { username, password }, { silent: true }),
+  /** 回显当前身份（刷新页面时用它恢复登录态） */
+  me: () => http.get('/auth/me', null, { silent: true }),
+}
+
 /* ---------------- 其他 ---------------- */
 export const SystemApi = {
   health: () => http.get('/health', null, { silent: true }),
 }
 
-/** 预警大类中文映射（后端 warning_type 存英文码） */
+/** 预警大类中文映射（后端 warning_type 存英文码）*/
 export const WARNING_TYPE_TEXT = { consume: '消费异常', study: '学习行为', health: '健康作息' }
-/** 消费波动/规律类指标的展示色（饼图、簇柱状图共用，保证同页同义） */
-export const PALETTE = ['#37e2f0', '#4ea1ff', '#ffd166', '#7ee787', '#ff6b81', '#b28dff', '#ff9f43']

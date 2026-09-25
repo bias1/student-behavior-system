@@ -37,6 +37,27 @@ from models import db
 RULE_TYPE = {"HIGH_CONSUME": "consume", "LOW_CONSUME": "consume", "NIGHT_CONSUME": "consume",
              "MEAL_IRREGULAR": "health", "NO_LIBRARY": "study", "OVERSTAY": "study"}
 
+_SNAPSHOT_READY = False
+
+
+def ensure_snapshot_column() -> None:
+    """
+    老库自愈：给 warning 补 rule_name 快照列（审计问题：逻辑外键只保证历史记录不丢，
+    但 to_dict 回查当前规则表，事后改名会"篡改"历史列表展示）。
+    进程内探测一次；扫描写入前调用，对已有新库零成本。同时对历史空行做一次背靠填充。
+    """
+    global _SNAPSHOT_READY
+    if _SNAPSHOT_READY:
+        return
+    with db.engine.begin() as conn:
+        has = conn.execute(text("SHOW COLUMNS FROM warning LIKE 'rule_name'")).first()
+        if not has:
+            conn.execute(text("ALTER TABLE warning ADD COLUMN rule_name VARCHAR(80) NULL"
+                              " COMMENT '规则名称快照（触发时）' AFTER rule_code"))
+        conn.execute(text("UPDATE warning w JOIN warning_rule r ON w.rule_code = r.rule_code"
+                          " SET w.rule_name = r.rule_name WHERE w.rule_name IS NULL"))
+    _SNAPSHOT_READY = True
+
 
 def _load_rules() -> Dict[str, Dict[str, Any]]:
     """读取启用的规则；缺失字段用默认值兜底，保证规则表被误改也不会崩"""
@@ -120,11 +141,20 @@ def rule_high_consume(data: Dict[str, pd.DataFrame], dates: pd.DatetimeIndex, cf
     def build(sid, d):
         v = float(amt.loc[sid, pd.Timestamp(d)])
         base = float(own[sid])
-        return {"metric_value": round(v, 2),
-                "message": f"{d} 单日消费 {v:.2f} 元，超过阈值 {thr:.0f} 元"
-                           f"（个人日均 {base:.2f} 元）",
+        ratio = round(v / base, 2) if base else None
+        # 文案必须区分触发口径（审计发现的逻辑 Bug）：130 元只命中"个人基线 3 倍"分支时，
+        # 写"超过阈值 300 元"是错的；两种口径的处置建议也不同（偶发采购 vs 消费习惯突变）
+        if v > thr:
+            msg = f"{d} 单日消费 {v:.2f} 元，超过绝对阈值 {thr:.0f} 元（个人日均 {base:.2f} 元）"
+            trigger = "absolute"
+        else:
+            msg = (f"{d} 单日消费 {v:.2f} 元，达个人日均 {base:.2f} 元的 {ratio or 0:.1f} 倍"
+                   f"（基线倍数 {mult:.0f}，未超绝对阈值 {thr:.0f} 元）")
+            trigger = "relative"
+        return {"metric_value": round(v, 2), "message": msg,
                 "detail": {"day_amount": round(v, 2), "own_avg": round(base, 2),
-                           "ratio": round(v / base, 2) if base else None, "threshold": thr}}
+                           "ratio": ratio, "threshold": thr, "multiplier": mult,
+                           "trigger": trigger}}
     return _melt(mask, build)
 
 
@@ -205,7 +235,7 @@ def rule_night_consume(data: Dict[str, pd.DataFrame], dates: pd.DatetimeIndex, c
     times = int(cfg["json"].get("times", 3))
     h0, h1 = _night_hours(cfg)
     night = _pivot(data["cons"], "night", dates)
-    total = night.sum(axis=1)                       # 统计窗口内深夜消费累计次数
+    total = night.sum(axis=1)                       # 统计窗口内深夜消费累计次数（口径随分析窗口，不是自然月）
     hit = total[total >= times]
     if hit.empty:
         return []
@@ -244,15 +274,31 @@ def rule_no_library(data: Dict[str, pd.DataFrame], dates: pd.DatetimeIndex, cfg:
     lib = data["lib"]
     last = (pd.to_datetime(lib["d"]).groupby(lib["student_id"].values).max() if len(lib)
             else pd.Series(dtype="datetime64[ns]"))
+    # 窗口开始前的最后一次进馆（审计发现的窗口边界问题）：data["lib"] 只含窗口内记录，
+    # "窗口前几周刚进过馆"与"从没进过馆"会被混成同一种"窗口内无记录"，
+    # 连续天数被截断成窗口长度。补查一次窗口前的 MAX，才能报出真实间隔。
+    prev = pd.read_sql(text(
+        "SELECT student_id, MAX(DATE(gate_in_time)) AS d FROM library_record"
+        " WHERE is_valid = 1 AND gate_in_time < :start GROUP BY student_id"),
+        con=db.engine, params={"start": str(dates[0].date())})
+    prev_last = pd.Series(pd.to_datetime(prev["d"]).values, index=prev["student_id"].values) \
+        if len(prev) else pd.Series(dtype="datetime64[ns]")
     all_students = data["students"]["student_id"].tolist()
     rows = []
     for sid in all_students:
-        gap = (dates[-1] - last[sid]).days if sid in last.index else len(dates)
+        if sid in last.index:
+            ref, in_window = last[sid], True
+        elif sid in prev_last.index:
+            ref, in_window = prev_last[sid], False
+        else:
+            ref, in_window = None, False
+        gap = (dates[-1] - ref).days if ref is not None else len(dates)
         if gap >= days:
             rows.append({"student_id": sid, "warning_date": dates[-1].date(), "metric_value": float(gap),
-                         "message": f"已连续 {gap} 天无进馆记录（阈值 {days} 天），学习行为异常",
+                         "message": f"已连续 {gap} 天无进馆记录（阈值 {days} 天），学习行为异常"
+                                    + ("" if in_window or ref is None else f"，末次进馆 {ref.date()}"),
                          "detail": {"gap_days": int(gap), "threshold_days": days,
-                                    "last_visit": str(last[sid].date()) if sid in last.index else None}})
+                                    "last_visit": str(ref.date()) if ref is not None else None}})
     return rows
 
 
@@ -292,6 +338,7 @@ def scan(start: str, end: str, rules: List[str] | None = None) -> Dict[str, Any]
     同一 (学生, 规则, 日期) 只保留一条，重复执行只更新数值，不产生重复预警。
     """
     rules_cfg = _load_rules()
+    ensure_snapshot_column()             # 写入前先保证 rule_name 快照列存在（老库自愈）
     # 深夜口径只有一处定义：从 NIGHT_CONSUME 配置读出小时区间，再取数，避免规则与 SQL 各说各话
     n0, n1 = _night_hours(rules_cfg.get("NIGHT_CONSUME", {"json": {}}))
     data = _daily_data(start, end, n0, n1)
@@ -310,6 +357,8 @@ def scan(start: str, end: str, rules: List[str] | None = None) -> Dict[str, Any]
         for h in hits:
             rows.append({
                 "student_id": h["student_id"], "rule_code": code,
+                # 触发时的规则名随记入库，事后改名不回溯历史列表
+                "rule_name": tinfo["rule_name"],
                 "warning_type": tinfo["warning_type"], "warning_level": tinfo["level"],
                 "warning_date": h["warning_date"], "metric_value": h.get("metric_value"),
                 "detail_json": json.dumps(h.get("detail", {}), ensure_ascii=False, default=str),
@@ -320,13 +369,14 @@ def scan(start: str, end: str, rules: List[str] | None = None) -> Dict[str, Any]
     if rows:
         # 唯一键幂等：重复扫描更新指标与文案，已人工处理过的不改状态（保留处置痕迹）
         sql = text("""
-            INSERT INTO warning (student_id, rule_code, warning_type, warning_level, warning_date,
+            INSERT INTO warning (student_id, rule_code, rule_name, warning_type, warning_level, warning_date,
                                  metric_value, detail_json, message, status)
-            VALUES (:student_id, :rule_code, :warning_type, :warning_level, :warning_date,
+            VALUES (:student_id, :rule_code, :rule_name, :warning_type, :warning_level, :warning_date,
                     :metric_value, :detail_json, :message, 0)
             ON DUPLICATE KEY UPDATE metric_value = VALUES(metric_value),
                                     message = VALUES(message),
                                     detail_json = VALUES(detail_json),
+                                    rule_name = VALUES(rule_name),
                                     warning_level = VALUES(warning_level)
             """)
         with db.engine.begin() as conn:

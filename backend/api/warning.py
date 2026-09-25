@@ -22,17 +22,81 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, request
 from sqlalchemy import func, or_
+from sqlalchemy.orm import joinedload
 
 from analysis import warning as syllabus
 from analysis import warning_rules as extended
 from models import Student, Warning, WarningRule, db
-from utils import fail, ok, parse_int, resolve_window
+from utils import fail, ok, parse_date, parse_int, parse_int_strict, resolve_window
 
 bp = Blueprint("warning", __name__, url_prefix="/api/warning")
+
+
+def _check_dates(*names) -> Optional[str]:
+    """query 里的日期筛选要么不传、传了就必须能解析，否则给出 400 文案
+    （非法日期直接下推 MySQL 只会得到截断警告或 500，前端拿不到可操作的提示）"""
+    for n in names:
+        raw = request.args.get(n)
+        if raw and parse_date(n) is None:
+            return f"参数 {n} 日期格式应为 YYYY-MM-DD，收到：{str(raw)[:40]}"
+    return None
+
+
+def _valid_date(v: Any) -> bool:
+    """校验 JSON body 里的日期值（query 里的用 _check_dates）：与 utils.parse_date 同格式集"""
+    if not v:
+        return True
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            datetime.strptime(str(v), fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _filter_conds() -> tuple[list, Optional[str]]:
+    """
+    列表与统计卡共用的筛选条件（审计问题：顶部统计卡不随日期/级别筛选联动，
+    筛到 12 条却显示"总数 482"像统计出错）。返回 (条件列表, 400 文案)；
+    关键词用子查询而不是 join，避免与列表页的 joinedload(student) 叠成重复关联。
+    """
+    conds: list = []
+    status, err = parse_int_strict("status", allowed=(0, 1, 2))
+    if err:
+        return conds, err
+    if status is not None:
+        conds.append(Warning.status == status)
+    level, err = parse_int_strict("level", allowed=(1, 2, 3))
+    if err:
+        return conds, err
+    if level is not None:
+        conds.append(Warning.warning_level >= level)      # "最低级别"语义：中及以上
+    bad = _check_dates("start", "end")
+    if bad:
+        return conds, bad
+    wtype = (request.args.get("type") or "").strip()[:20]
+    if wtype:
+        conds.append(Warning.warning_type == wtype)
+    rule = (request.args.get("rule_code") or "").strip()[:40]
+    if rule:
+        conds.append(Warning.rule_code == rule)
+    keyword = (request.args.get("keyword") or "").strip()[:50]
+    if keyword:
+        like = f"%{keyword.replace('%', r'\%').replace('_', r'\_')}%"
+        conds.append(Warning.student_id.in_(
+            db.session.query(Student.student_id).filter(
+                or_(Student.student_id.like(like), Student.name.like(like)))))
+    start, end = parse_date("start"), parse_date("end")
+    if start:
+        conds.append(Warning.warning_date >= start)
+    if end:
+        conds.append(Warning.warning_date <= end)
+    return conds, None
 
 
 @bp.get("/list")
@@ -42,33 +106,16 @@ def warning_list():
     默认排序：级别高的在前、日期新的在前 —— 辅导员打开页面先看到最紧急的。
     """
     page, size = parse_int("page", 1, 1, 10000), parse_int("size", 20, 1, 200)
-    q = Warning.query
-
-    status = request.args.get("status")
-    if status not in (None, ""):
-        q = q.filter(Warning.status == int(status))
-    level = request.args.get("level")
-    if level:
-        q = q.filter(Warning.warning_level >= int(level))
-    wtype = request.args.get("type")
-    if wtype:
-        q = q.filter(Warning.warning_type == wtype)
-    rule = request.args.get("rule_code")
-    if rule:
-        q = q.filter(Warning.rule_code == rule)
-    keyword = (request.args.get("keyword") or "").strip()
-    if keyword:
-        like = f"%{keyword.replace('%', r'\%').replace('_', r'\_')}%"
-        q = q.join(Warning.student).filter(or_(Warning.student_id.like(like),
-                                               Student.name.like(like)))
-    start, end = request.args.get("start"), request.args.get("end")
-    if start:
-        q = q.filter(Warning.warning_date >= start)
-    if end:
-        q = q.filter(Warning.warning_date <= end)
+    conds, err = _filter_conds()
+    if err:
+        return fail(err)
+    q = Warning.query.filter(*conds)
 
     total = q.count()
-    rows = (q.order_by(Warning.warning_level.desc(), Warning.warning_date.desc(), Warning.id.desc())
+    # joinedload 预加载学生/规则，消除 to_dict 逐行懒加载的 N+1（size=200 时约 401 查 -> 1 查）；
+    # options 只加在取行查询上，不污染上面的 count()
+    rows = (q.options(joinedload(Warning.student), joinedload(Warning.rule))
+            .order_by(Warning.warning_level.desc(), Warning.warning_date.desc(), Warning.id.desc())
             .offset((page - 1) * size).limit(size).all())
     return ok({"total": total, "page": page, "size": size,
                "items": [w.to_dict() for w in rows]})
@@ -76,17 +123,23 @@ def warning_list():
 
 @bp.get("/stats")
 def warning_stats():
-    """按类型/级别/日期三个角度统计，大屏与列表页顶部卡片共用"""
-    by_type = db.session.query(Warning.warning_type, func.count(Warning.id)) \
+    """按类型/级别/日期三个角度统计，大屏与列表页顶部卡片共用。
+    支持与 /list 完全同口径的筛选（前端把同一套 queryParams 传进来，统计卡才不会和表格打架）。"""
+    conds, err = _filter_conds()
+    if err:
+        return fail(err)
+    def base():
+        return db.session.query(Warning).filter(*conds)
+    by_type = base().with_entities(Warning.warning_type, func.count(Warning.id)) \
         .group_by(Warning.warning_type).all()
-    by_level = db.session.query(Warning.warning_level, func.count(Warning.id)) \
+    by_level = base().with_entities(Warning.warning_level, func.count(Warning.id)) \
         .group_by(Warning.warning_level).all()
-    by_rule = db.session.query(Warning.rule_code, func.count(Warning.id),
-                               func.max(Warning.warning_level)) \
+    by_rule = base().with_entities(Warning.rule_code, func.count(Warning.id),
+                                   func.max(Warning.warning_level)) \
         .group_by(Warning.rule_code).order_by(func.count(Warning.id).desc()).all()
-    by_date = db.session.query(Warning.warning_date, func.count(Warning.id)) \
+    by_date = base().with_entities(Warning.warning_date, func.count(Warning.id)) \
         .group_by(Warning.warning_date).order_by(Warning.warning_date).all()
-    by_status = db.session.query(Warning.status, func.count(Warning.id)) \
+    by_status = base().with_entities(Warning.status, func.count(Warning.id)) \
         .group_by(Warning.status).all()
     rule_names = {r.rule_code: r.rule_name for r in WarningRule.query.all()}
 
@@ -121,6 +174,8 @@ def warning_scan():
     payload = request.get_json(silent=True) or {}
     start = payload.get("start") or request.args.get("start")
     end = payload.get("end") or request.args.get("end")
+    if not _valid_date(start) or not _valid_date(end):
+        return fail("start/end 日期格式应为 YYYY-MM-DD")
     if not start or not end:
         w_start, w_end, _ = resolve_window()
         start, end = start or w_start, end or w_end
@@ -152,6 +207,8 @@ def warning_refresh():
         return payload.get(name) if payload.get(name) is not None else request.args.get(name, default)
 
     start, end = arg("start"), arg("end")
+    if not _valid_date(start) or not _valid_date(end):
+        return fail("start/end 日期格式应为 YYYY-MM-DD")
     if not start or not end:
         w_start, w_end, _ = resolve_window()
         start, end = start or w_start, end or w_end
@@ -207,7 +264,10 @@ def warning_handle(wid: int):
     w = db.session.get(Warning, wid)
     if w is None:
         return fail(f"预警记录 {wid} 不存在", 404)
-    status = int(payload.get("status", 1))
+    try:
+        status = int(payload.get("status", 1))
+    except (TypeError, ValueError):
+        return fail("status 只能是 0/1/2")
     if status not in (0, 1, 2):
         return fail("status 只能是 0/1/2")
     w.status = status

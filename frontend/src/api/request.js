@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { ElMessage } from 'element-plus'
+import { toast } from '@/components/ui/toast'
 
 /**
  * axios 统一封装
@@ -30,23 +30,31 @@ const HTTP_TEXT = {
 
 // 同一时刻多个接口一起失败（后端没起）会弹一堆一样的 toast，用一个标志位合并
 let notifying = false
-function toast(msg, type = 'error') {
+function notifyError(msg, type = 'error') {
   if (notifying) return
   notifying = true
-  ElMessage({ message: msg, type, duration: 3000, showClose: true })
+  if (type === 'error') toast.error(msg)
+  else toast.success(msg)
   setTimeout(() => (notifying = false), 800)
 }
+
+// 登录令牌存储键：后端 auth 守卫开启后，除 /auth/* 外所有接口都要带 Bearer token
+export const TOKEN_KEY = 'sb_token'
+export const getToken = () => localStorage.getItem(TOKEN_KEY) || ''
+export const setToken = (t) => localStorage.setItem(TOKEN_KEY, t)
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY)
 
 const service = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
   timeout: 20000,
-  // 大屏数据都是 GET + query，不需要 withCredentials；后续加登录态时在此打开
+  // 令牌走 Authorization 头而不是 Cookie，无 CSRF 面，不需要 withCredentials
 })
 
 service.interceptors.request.use(
   (cfg) => {
-    // 预留：登录后在此注入 Authorization
-    // cfg.headers.Authorization = `Bearer ${localStorage.getItem('token')}`
+    // 登录守卫（backend/api/auth.py）：除白名单外一律要求 Bearer token
+    const token = getToken()
+    if (token) cfg.headers.Authorization = `Bearer ${token}`
     return cfg
   },
   (error) => Promise.reject(error)
@@ -57,11 +65,11 @@ service.interceptors.response.use(
     const body = response.data
     // 代理目标是后端未启动时会被 HTML 错误页命中，这类"结构不对"要单独报出来
     if (!body || typeof body !== 'object' || !('code' in body)) {
-      toast('接口返回结构异常，请确认后端服务版本')
+      notifyError('接口返回结构异常，请确认后端服务版本')
       return Promise.reject(new Error('unexpected response shape'))
     }
     if (body.code !== 200) {
-      if (!response.config.silent) toast(body.msg || '请求失败')
+      if (!response.config.silent) notifyError(body.msg || '请求失败')
       const err = new Error(body.msg || 'business error')
       err.code = body.code
       err.data = body.data
@@ -77,11 +85,21 @@ service.interceptors.response.use(
     } else if (error.response) {
       const { status, data } = error.response
       msg = data?.msg || HTTP_TEXT[status] || `HTTP ${status}`
+      // 401 = 未登录/过期：清掉本地令牌跳登录页（登录接口自身的 401 是"密码错"，不能跳）
+      const isAuthApi = (error.config?.url || '').startsWith('/auth/')
+      if (status === 401 && !isAuthApi) {
+        clearToken()
+        if (!window.location.pathname.startsWith('/login')) {
+          const redirect = encodeURIComponent(window.location.pathname + window.location.search)
+          window.location.href = `/login?redirect=${redirect}`
+        }
+        msg = msg || '登录已过期，请重新登录'
+      }
     } else {
       // 没有 response 说明请求没拿到 HTTP 响应：后端未启动 / 代理目标错误 / 网络断开
       msg = '无法连接后端服务，请先启动 python app.py（默认 http://127.0.0.1:5000）'
     }
-    if (!silent) toast(msg)
+    if (!silent) notifyError(msg)
     const err = new Error(msg)
     err.silent = silent
     err.original = error

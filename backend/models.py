@@ -191,6 +191,9 @@ class Warning(db.Model):
     student_id = db.Column(db.String(20), db.ForeignKey("student.student_id", name="fk_warn_student"),
                            nullable=False, index=True, comment="学号")
     rule_code = db.Column(db.String(40), nullable=False, comment="触发的规则编码（逻辑外键）")
+    # 规则名快照：扫描写入时随带当时的 rule_name，事后改名/停用不回溯历史预警；
+    # 旧数据未回填时 to_dict 仍回退到规则表回查（与历史行为一致）
+    rule_name = db.Column(db.String(80), comment="规则名称快照（触发时）")
     warning_type = db.Column(db.String(30), nullable=False, comment="consume/study/health（冗余，免回表）")
     warning_level = db.Column(db.SmallInteger, nullable=False, default=2, comment="1-低 2-中 3-高")
     warning_date = db.Column(db.Date, nullable=False, comment="业务日期")
@@ -217,7 +220,8 @@ class Warning(db.Model):
             "college": self.student.college if self.student else None,
             "class_name": self.student.class_name if self.student else None,
             "rule_code": self.rule_code,
-            "rule_name": self.rule.rule_name if self.rule else self.rule_code,
+            # 优先用触发时的快照名；没有快照（历史存量行）才回退到当前规则表，再退到编码
+            "rule_name": self.rule_name or (self.rule.rule_name if self.rule else self.rule_code),
             "warning_type": self.warning_type,
             "warning_level": self.warning_level,
             "warning_level_text": WARNING_LEVELS.get(self.warning_level, "中"),

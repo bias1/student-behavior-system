@@ -16,6 +16,10 @@ import sys
 
 import pymysql
 
+from db_env import load_dotenv
+
+load_dotenv()          # 与后端读同一份 .env，避免两处口令不一致
+
 DEFAULT_SQL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "database", "schema.sql")
 

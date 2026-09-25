@@ -131,7 +131,6 @@ def consumption_trend(start: str, end: str) -> Dict[str, Any]:
         lib = lib.set_index(pd.DatetimeIndex(pd.to_datetime(lib["d"]))).reindex(idx, fill_value=0)
 
     dates = [d.strftime("%Y-%m-%d") for d in idx]
-    n_students = int(df["students"].max() or 1)
     return {
         "dates": dates,
         "weekday": [WEEKDAYS_CN[d.weekday()] for d in idx],
@@ -140,8 +139,10 @@ def consumption_trend(start: str, end: str) -> Dict[str, Any]:
             "amount": [round(float(v), 2) for v in df["amount"]],
             "records": [int(v) for v in df["records"]],
             "students": [int(v) for v in df["students"]],
-            # 人均笔数：消除"参与人数变化"的干扰，工作日/周末差异才看得准
-            "avg_records_per_student": [round(float(v) / max(1, n_students), 2) for v in df["records"]],
+            # 人均笔数：逐日用"当日笔数 / 当日消费人数"。旧实现除的是窗口内最大人数，
+            # 周末只有 20 人消费时会被 100 人的峰值分母摊薄，工作日/周末对比彻底失真
+            "avg_records_per_student": [round(float(r) / max(1, int(s)), 2)
+                                        for r, s in zip(df["records"], df["students"])],
             "library_visits": [int(v) for v in (lib["visits"] if len(lib) else [0] * len(idx))],
             "library_minutes": [round(float(v or 0) / 60, 2) for v in
                                 (lib["minutes"] if len(lib) else [0] * len(idx))],
@@ -376,3 +377,180 @@ def consumption_rank(start: str, end: str, limit: int = 10, order: str = "desc")
         {"start": start, "end": end, "limit": int(limit)},
     )
     return df.replace({np.nan: None}).to_dict(orient="records")
+
+
+# =============================================================================
+# 5. 汇总接口（概览页 KPI 卡、环比 / 小泡图）
+# =============================================================================
+
+import datetime as _dt  # noqa: E402  局部导入，避免与上面主体冲突
+
+
+def summary_metrics(start: str, end: str, days: int) -> Dict[str, Any]:
+    """
+    概览页汇总指标。
+
+    返回字段:
+      window / prev_window   当前窗口与上一环比窗口（字符串 [start, end]）
+      student_count          全库学生数
+      active_rate            窗口内有过消费 OR 进馆的学生占比 (%)
+      total_amount           窗口内消费总额
+      avg_daily_study_minutes  日均图书馆时长（人均，分）
+      warning_count          累计预警总数
+      warning_pending        未处理预警数
+      amount_delta           消费总额环比 (%)，前窗口为 0 时返回 None
+      study_delta            日均在馆时长环比 (%)
+      warning_delta          新增预警环比 (%)
+      active_delta           活跃率环比 (百分点)
+      spark_amount           窗口内每日消费额（小泡图）
+      spark_library          窗口内每日在馆分钟
+      spark_warning          窗口内每日新增预警数
+    """
+    # ---------- 上一窗口 ----------
+    s_dt = _dt.date.fromisoformat(start)
+    e_dt = _dt.date.fromisoformat(end)
+    prev_s = (s_dt - _dt.timedelta(days=days)).isoformat()
+    prev_e = (s_dt - _dt.timedelta(days=1)).isoformat()
+
+    # ---------- 当前窗口数据 ----------
+    stu_total = int(_read("SELECT COUNT(*) n FROM student").iloc[0]["n"] or 0)
+
+    cur = _read(
+        """
+        SELECT SUM(amount) total_amount,
+               COUNT(DISTINCT student_id) active_students
+        FROM consumption
+        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        """,
+        {"start": start, "end": end},
+    ).iloc[0]
+    cur_lib = _read(
+        """
+        SELECT ROUND(SUM(stay_minutes) / NULLIF(COUNT(DISTINCT student_id), 0) / :days, 1) avg_daily_min,
+               COUNT(DISTINCT student_id) lib_students
+        FROM library_record
+        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        """,
+        {"start": start, "end": end, "days": days},
+    ).iloc[0]
+    warn_row = _read(
+        "SELECT COUNT(*) n, SUM(status=0) pending FROM warning"
+    ).iloc[0]
+    new_warn_cur = int(_read(
+        "SELECT COUNT(*) n FROM warning WHERE warning_date >= :start AND warning_date <= :end",
+        {"start": start, "end": end},
+    ).iloc[0]["n"] or 0)
+
+    # 当前窗口内有过消费 OR 进馆的学生数（去重）
+    active_combined = int(_read(
+        """
+        SELECT COUNT(DISTINCT student_id) n FROM (
+            SELECT student_id FROM consumption
+            WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+            UNION
+            SELECT student_id FROM library_record
+            WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        ) t
+        """,
+        {"start": start, "end": end},
+    ).iloc[0]["n"] or 0)
+
+    # ---------- 上一窗口数据（环比） ----------
+    prev = _read(
+        """
+        SELECT SUM(amount) total_amount,
+               COUNT(DISTINCT student_id) active_students
+        FROM consumption
+        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        """,
+        {"start": prev_s, "end": prev_e},
+    ).iloc[0]
+    prev_lib = _read(
+        """
+        SELECT ROUND(SUM(stay_minutes) / NULLIF(COUNT(DISTINCT student_id), 0) / :days, 1) avg_daily_min
+        FROM library_record
+        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        """,
+        {"start": prev_s, "end": prev_e, "days": days},
+    ).iloc[0]
+    new_warn_prev = int(_read(
+        "SELECT COUNT(*) n FROM warning WHERE warning_date >= :start AND warning_date <= :end",
+        {"start": prev_s, "end": prev_e},
+    ).iloc[0]["n"] or 0)
+    prev_active_combined = int(_read(
+        """
+        SELECT COUNT(DISTINCT student_id) n FROM (
+            SELECT student_id FROM consumption
+            WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+            UNION
+            SELECT student_id FROM library_record
+            WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        ) t
+        """,
+        {"start": prev_s, "end": prev_e},
+    ).iloc[0]["n"] or 0)
+
+    # ---------- 计算占比与环比 ----------
+    def pct(cur_v, prev_v):  # 环比 %，prev 为 0 则 None
+        cv = float(cur_v or 0)
+        pv = float(prev_v or 0)
+        if pv == 0:
+            return None
+        return round((cv - pv) / pv * 100, 1)
+
+    active_rate = round(active_combined / stu_total * 100, 1) if stu_total else 0.0
+    prev_active_rate = round(prev_active_combined / stu_total * 100, 1) if stu_total else 0.0
+
+    # ---------- 小泡图（每日聚合） ----------
+    idx = pd.date_range(start=start, end=end, freq="D")
+    spark_amount_df = _read(
+        """
+        SELECT DATE(consumed_at) d, ROUND(SUM(amount),2) v
+        FROM consumption
+        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        GROUP BY d
+        """,
+        {"start": start, "end": end},
+    )
+    spark_library_df = _read(
+        """
+        SELECT DATE(gate_in_time) d, ROUND(SUM(stay_minutes),0) v
+        FROM library_record
+        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        GROUP BY d
+        """,
+        {"start": start, "end": end},
+    )
+    spark_warning_df = _read(
+        """
+        SELECT warning_date d, COUNT(*) v
+        FROM warning
+        WHERE warning_date >= :start AND warning_date <= :end
+        GROUP BY d
+        """,
+        {"start": start, "end": end},
+    )
+
+    def _spark(df, label_col="v"):
+        if not len(df):
+            return [0] * len(idx)
+        series = df.set_index(pd.DatetimeIndex(pd.to_datetime(df["d"]))).reindex(idx, fill_value=0)
+        return [round(float(x), 2) for x in series[label_col]]
+
+    return {
+        "window": [start, end],
+        "prev_window": [prev_s, prev_e],
+        "student_count": stu_total,
+        "active_rate": active_rate,
+        "total_amount": round(float(cur["total_amount"] or 0), 2),
+        "avg_daily_study_minutes": float(cur_lib["avg_daily_min"] or 0),
+        "warning_count": int(warn_row["n"] or 0),
+        "warning_pending": int(warn_row["pending"] or 0),
+        "amount_delta": pct(cur["total_amount"], prev["total_amount"]),
+        "study_delta": pct(cur_lib["avg_daily_min"], prev_lib["avg_daily_min"]),
+        "warning_delta": pct(new_warn_cur, new_warn_prev),
+        "active_delta": round(active_rate - prev_active_rate, 1),
+        "spark_amount": _spark(spark_amount_df),
+        "spark_library": _spark(spark_library_df),
+        "spark_warning": _spark(spark_warning_df),
+    }

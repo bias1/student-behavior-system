@@ -1,24 +1,20 @@
 import { createApp } from 'vue'
-import ElementPlus from 'element-plus'
-import zhCn from 'element-plus/es/locale/lang/zh-cn'
-import * as ElIcons from '@element-plus/icons-vue'
 
-import 'element-plus/dist/index.css'
-import 'element-plus/theme-chalk/dark/css-vars.css'   // 暗黑主题变量，配合 index.html 的 <html class="dark">
+// 本地字体：Inter Variable 随构建产物打包，离线/内网环境可用；中文走系统栈（见 theme.css --font-sans）
+import '@fontsource-variable/inter'
+
 import '@/styles/theme.css'
-import '@/plugins/echarts'                            // 副作用导入：注册 sb-dark 主题
+import '@/plugins/echarts'                            // 副作用导入：注册 insight-dark 主题
 
 import App from './App.vue'
 import router from './router'
 
+/**
+ * 入口（Campus Insight 重构后）：
+ * 不再全局注册任何组件库 —— Element Plus 已移除，
+ * 基础件在 src/components/ui/ 自研，页面按需 import；图标直接用 lucide-vue-next 组件。
+ */
 const app = createApp(App)
 
-// 图标全局注册：<el-icon><Refresh /></el-icon> 才认得组件名（模板里用字符串组件名解析）
-for (const [name, comp] of Object.entries(ElIcons)) {
-  app.component(name, comp)
-}
-
-// Element Plus 全量引入：演示项目换取配置简单；若要瘦身可换 unplugin-vue-components 按需自动导入
-app.use(ElementPlus, { locale: zhCn })
 app.use(router)
 app.mount('#app')

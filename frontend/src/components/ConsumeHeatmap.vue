@@ -17,6 +17,7 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { ConsumptionApi } from '@/api'
+import { C } from '@/styles/palette'
 import BaseChart from './BaseChart.vue'
 
 const props = defineProps({
@@ -126,7 +127,7 @@ const option = computed(() => {
       type: 'category',
       data: Array.from({ length: 24 }, (_, i) => i),
       name: '时',
-      nameTextStyle: { color: '#9fbadb' },
+      nameTextStyle: { color: C.text2 },
       splitArea: { show: true },              // 暗色棋盘格，帮眼睛对齐行列
       // 24 个标签挤一行会重叠，按需要隔 1 或隔 2 显示（窄容器用 3）
       axisLabel: { interval: (i) => i % 2 === 0, formatter: (v) => `${v}` },
@@ -149,9 +150,9 @@ const option = computed(() => {
       itemHeight: 100,
       precision: isAmount ? 1 : 0,
       text: ['高', '低'],
-      textStyle: { color: '#9fbadb' },
+      textStyle: { color: C.text2 },
       // 深海蓝 → 青 → 黄 → 红：暗背景下明度递增，色盲同学也能区分强弱
-      inRange: { color: ['#0e2440', '#1d6fa5', '#37e2f0', '#ffd166', '#ff6b81'] },
+      inRange: { color: ['#0b1a2e', '#1a5276', C.cyan, C.warning, C.danger] },
     },
     series: [
       {
@@ -160,9 +161,9 @@ const option = computed(() => {
         data: cells,
         progressive: 0,                        // 168 格不需要增量渲染，关了可避免切换指标时残影
         label: { show: false },                // 打开会在每格写数字，投屏时太吵
-        itemStyle: { borderColor: 'rgba(6,16,32,0.65)', borderWidth: 1 },
+        itemStyle: { borderColor: 'rgba(11,15,20,0.7)', borderWidth: 1 },
         emphasis: {
-          itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,0,0,0.6)', borderColor: '#fff', borderWidth: 1 },
+          itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,0,0,0.6)', borderColor: C.text, borderWidth: 1 },
         },
       },
     ],

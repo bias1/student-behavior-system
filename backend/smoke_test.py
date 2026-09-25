@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 from app import create_app
@@ -23,6 +24,9 @@ CASES = [
     ("GET", "/", None, ["endpoints"]),
     ("GET", "/api/overview", None,
      ["student_count", "total_amount", "avg_daily_study_minutes", "consume_peak_hour"]),
+    ("GET", "/api/overview/summary?days=30", None,
+     ["window", "student_count", "active_rate", "amount_delta",
+      "warning_count", "spark_amount", "spark_library"]),
     ("GET", "/api/overview/meta", None, ["date_start", "date_end", "merchant_types"]),
     ("GET", "/api/overview/groups?dim=college", None, ["items", "dim"]),
     ("GET", "/api/overview/groups?dim=grade", None, ["items"]),
@@ -35,6 +39,7 @@ CASES = [
     ("GET", "/api/library/heatmap", None, ["hours", "data", "max"]),
     ("GET", "/api/library/hours", None, ["hour_dist"]),
     ("GET", "/api/student/list?size=5", None, ["total", "items"]),
+    ("GET", "/api/student/list?size=5&with_stats=1", None, ["total", "items"]),  # with_stats 字段验证
     # 学生不存在 -> 404
     ("GET", "/api/student/__no_such__/profile", None, None),
     ("POST", "/api/warning/scan", {}, ["written", "by_rule", "rules_enabled"]),
@@ -50,6 +55,8 @@ CASES = [
     ("GET", "/api/warning/list?status=0&level=2", None, ["items"]),
     ("GET", "/api/warning/stats", None, ["total", "by_type", "by_rule", "trend"]),
     ("GET", "/api/warning/rules", None, None),                       # 返回 list，无 dict 字段
+    # 认证探活入例（匿名白名单）；登录/401 拦截另外在主循环前做前置校验
+    ("GET", "/api/auth/status", None, ["enabled"]),
     # 手肘法：默认按总纲要求扫 K=2..8，输出 SSE 曲线
     ("GET", "/api/clustering/elbow?k_min=2&k_max=8", None,
      ["k", "inertia", "sse", "silhouette", "total_ss", "feature_set"]),
@@ -84,6 +91,36 @@ def main() -> int:
     passed = failed = 0
     sid = None
 
+    # 登录守卫适配：冒烟脚本不"先登录再跑全量"，走 API_ADMIN_TOKEN 服务旁路；
+    # .env 未配置时临时注入一个，保证 AUTH_ENABLED=1 下所有用例不受 401 干扰
+    bypass = app.config.get("API_ADMIN_TOKEN") or f"smoke-{os.getpid()}"
+    app.config["API_ADMIN_TOKEN"] = bypass
+    headers = {"X-API-Token": bypass}
+
+    # 前置校验 1：未认证请求必须被拦（只有 AUTH_ENABLED=0 的旧演示模式才允许匿名读）
+    anon = client.get("/api/warning/list")
+    if app.config.get("AUTH_ENABLED"):
+        ok_guard = anon.status_code == 401
+        print(f"[{'PASS' if ok_guard else 'FAIL'}] 守卫：匿名访问 /api/warning/list -> "
+              f"{anon.status_code}（期望 401）")
+        passed += ok_guard
+        failed += not ok_guard
+    else:
+        print(f"[SKIP] AUTH_ENABLED=0：匿名读放行（旧演示模式），当前 -> {anon.status_code}")
+    # 前置校验 2：能用配置的明文凭据登录就拿 token（配了哈希时跳过，不阻断冒烟）
+    if app.config.get("AUTH_PASSWORD_HASH"):
+        print("[SKIP] 登录接口用例：配了 AUTH_PASSWORD_HASH，明文回退路径不参与登录")
+    else:
+        lr = client.post("/api/auth/login", json={
+            "username": app.config.get("AUTH_USERNAME"),
+            "password": app.config.get("AUTH_PASSWORD"),
+        })
+        ok_login = lr.status_code == 200 and bool((lr.get_json().get("data") or {}).get("token"))
+        print(f"[{'PASS' if ok_login else 'FAIL'}] 登录：POST /api/auth/login -> "
+              f"{lr.status_code}（期望 200 且返 token）")
+        passed += ok_login
+        failed += not ok_login
+
     with app.app_context():
         from models import Student
 
@@ -113,9 +150,9 @@ def main() -> int:
 
         try:
             if method == "GET":
-                resp = client.get(path)
+                resp = client.get(path, headers=headers)
             else:
-                resp = client.post(path, json=body or {})
+                resp = client.post(path, json=body or {}, headers=headers)
             payload = resp.get_json() or {}
             data = payload.get("data")
             http_code, size = resp.status_code, len(resp.data)
