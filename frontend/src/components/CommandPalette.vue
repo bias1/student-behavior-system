@@ -13,25 +13,32 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { CornerDownLeft, Search, User } from 'lucide-vue-next'
 import { StudentApi } from '@/api'
+import { useSession } from '@/composables/useSession'
 import UModal from './ui/UModal.vue'
 
 const emit = defineEmits(['close'])
 
 const router = useRouter()
+const session = useSession()
 const open = defineModel('open', { type: Boolean, default: false })
 
 const query = ref('')
 const selected = ref(0)
 const inputEl = ref(null)
 
-/* ---------------- 静态命令 ---------------- */
-const PAGE_COMMANDS = [
-  { id: 'overview', label: '群体概览', hint: 'Overview', action: () => router.push({ name: 'overview' }) },
-  { id: 'students', label: '学生列表', hint: 'Students', action: () => router.push({ name: 'students' }) },
-  { id: 'profile', label: '个体画像', hint: 'Student Profile', action: () => router.push({ name: 'student-profile' }) },
-  { id: 'risk', label: '风险中心', hint: 'Risk Center', action: () => router.push({ name: 'risk' }) },
-  { id: 'seg', label: '分群工作台', hint: 'Segmentation', action: () => router.push({ name: 'segmentation' }) },
+/* ---------------- 静态命令（带权限码，无权时隐藏）---------------- */
+const PAGE_COMMANDS_ALL = [
+  { id: 'overview',  label: '群体概览', hint: 'Overview',         perm: 'stats:read',      action: () => router.push({ name: 'overview' }) },
+  { id: 'students',  label: '学生列表', hint: 'Students',         perm: 'student:read',    action: () => router.push({ name: 'students' }) },
+  { id: 'profile',   label: '个体画像', hint: 'Student Profile',  perm: 'student:detail',  action: () => router.push({ name: 'student-profile' }) },
+  { id: 'risk',      label: '风险中心', hint: 'Risk Center',      perm: 'warning:read',    action: () => router.push({ name: 'risk' }) },
+  { id: 'seg',       label: '分群工作台', hint: 'Segmentation',   perm: 'clustering:read', action: () => router.push({ name: 'segmentation' }) },
 ]
+
+// 按会话权限过滤（认证关闭时 hasPerm 全放行）
+const PAGE_COMMANDS = computed(() =>
+  PAGE_COMMANDS_ALL.filter((c) => session.hasPerm(c.perm))
+)
 
 /* ---------------- 学生搜索结果 ---------------- */
 const stuResults = ref([])
@@ -60,8 +67,9 @@ watch(query, (v) => {
 /* ---------------- 合并列表 ---------------- */
 const filteredPages = computed(() => {
   const q = query.value.toLowerCase()
-  if (!q) return PAGE_COMMANDS
-  return PAGE_COMMANDS.filter((c) => c.label.includes(q) || c.hint.toLowerCase().includes(q))
+  const cmds = PAGE_COMMANDS.value
+  if (!q) return cmds
+  return cmds.filter((c) => c.label.includes(q) || c.hint.toLowerCase().includes(q))
 })
 
 const items = computed(() => [

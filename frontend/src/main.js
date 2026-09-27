@@ -4,10 +4,12 @@ import { createApp } from 'vue'
 import '@fontsource-variable/inter'
 
 import '@/styles/theme.css'
-import '@/plugins/echarts'                            // 副作用导入：注册 insight-dark 主题
+// ECharts 不再在入口副作用导入：主题注册在 src/plugins/echarts.js 模块内完成，
+// 由 BaseChart 随懒加载的路由 chunk 按需引入，登录页/纯表格页不再被迫等图表包
 
 import App from './App.vue'
 import router from './router'
+import { useTheme } from '@/composables/useTheme'
 
 /**
  * 入口（Campus Insight 重构后）：
@@ -15,6 +17,9 @@ import router from './router'
  * 基础件在 src/components/ui/ 自研，页面按需 import；图标直接用 lucide-vue-next 组件。
  */
 const app = createApp(App)
+
+// 主题在挂载前初始化：尽早把 data-theme 写到 <html>，避免深色→浅色的首屏闪烁（FOUC）
+useTheme().init()
 
 app.use(router)
 app.mount('#app')

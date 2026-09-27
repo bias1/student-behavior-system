@@ -13,7 +13,7 @@
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { RefreshCw } from 'lucide-vue-next'
+import { Activity, Database, RefreshCw, TrendingUp } from 'lucide-vue-next'
 import { ConsumptionApi, LibraryApi, OverviewApi } from '@/api'
 import { dataSpan, windowOptions } from '@/utils/window'
 import { fmtInt, fmtMoney, fmtNum } from '@/utils/format'
@@ -76,11 +76,14 @@ function loadAll() {
   loadOverview(); loadTrend(); loadPie(); loadLib()
 }
 
-onMounted(async () => {
-  // 先拿数据跨度再首拉：days 被钳到跨度时不会多请求一轮（重拉靠用户交互事件）
-  span.value = await dataSpan()
-  if (span.value > 0 && days.value > span.value) days.value = span.value
+onMounted(() => {
+  // 首屏并行：直接按默认 30 天窗拉数据（后端会把窗口钉在数据范围内），
+  // 跨度在后台取回来只用于修正窗口选择器选项，不再让图表请求串行等 meta
   loadAll()
+  dataSpan().then((s) => {
+    span.value = s
+    if (s > 0 && days.value > s) days.value = s   // 只改选中项不多拉一轮（重拉靠用户交互事件）
+  })
 })
 
 /* ---------------- 自动刷新 ---------------- */
@@ -140,6 +143,18 @@ const cards = computed(() => {
   ]
 })
 
+/* ---------------- 数据摘要条 ---------------- */
+const dataSummary = computed(() => {
+  const s = summary.value
+  const d = ov.value   // 别叫 ov：const 局部声明会遮蔽外层 ref，初始化前取值直接抛 ReferenceError
+  return {
+    records: d.consumption_records || 0,
+    libRecords: d.library_records || 0,
+    activeRate: s.active_rate || 0,
+    peakHour: d.consume_peak_hour,
+  }
+})
+
 /* ---------------- 图 1：消费趋势 ---------------- */
 const trendOption = computed(() => {
   const t = trend.value
@@ -184,7 +199,7 @@ const pieOption = computed(() => {
     series: [
       {
         type: 'pie', radius: ['40%', '66%'], center: ['36%', '52%'], avoidLabelOverlap: true,
-        itemStyle: { borderColor: 'rgba(11,15,20,0.9)', borderWidth: 2 },
+        itemStyle: { borderColor: 'rgba(128,128,128,0.35)', borderWidth: 2 },
         label: { show: true, formatter: '{b}\n{d}%', fontSize: 11 },
         labelLine: { length: 6, length2: 8 },
         data: rows.map((r) => ({ name: r.merchant_type, value: r.amount })),
@@ -202,7 +217,7 @@ const libOption = computed(() => {
     // 10px 时会和最大刻度标签（如 5200）重叠并贴边被裁
     grid: { left: 6, right: 6, top: 32, bottom: 4, containLabel: true },
     xAxis: { type: 'category', data: rows.map((r) => r.hour), axisLabel: { interval: (i) => i % 3 === 0 } },
-    yAxis: { type: 'value', name: '人次', nameTextStyle: { color: '#8b96a5', fontSize: 11, padding: [0, 0, 0, -16] } },
+    yAxis: { type: 'value', name: '人次', nameTextStyle: { fontSize: 11, padding: [0, 0, 0, -16] } },
     series: [
       {
         type: 'bar', barMaxWidth: 14, data: rows.map((r) => r.n),
@@ -231,6 +246,27 @@ const libOption = computed(() => {
         <UButton variant="ghost" size="sm" @click="refreshAll">
           <RefreshCw :size="13" /> 刷新
         </UButton>
+      </div>
+    </div>
+
+    <!-- 数据摘要条 -->
+    <div v-if="dataSummary.records" class="ov-data-bar">
+      <div class="data-bar-item">
+        <Database :size="12" class="data-bar-icon" />
+        <span class="data-bar-label">数据量</span>
+        <span class="data-bar-value">{{ fmtInt(dataSummary.records) }} 笔消费</span>
+        <span class="data-bar-sep">·</span>
+        <span class="data-bar-value">{{ fmtInt(dataSummary.libRecords) }} 次进馆</span>
+      </div>
+      <div class="data-bar-item">
+        <TrendingUp :size="12" class="data-bar-icon" />
+        <span class="data-bar-label">活跃率</span>
+        <span class="data-bar-value">{{ dataSummary.activeRate }}%</span>
+      </div>
+      <div class="data-bar-item">
+        <Activity :size="12" class="data-bar-icon" />
+        <span class="data-bar-label">消费高峰</span>
+        <span class="data-bar-value">{{ dataSummary.peakHour != null ? dataSummary.peakHour + ':00' : '--' }}</span>
       </div>
     </div>
 
@@ -323,6 +359,46 @@ const libOption = computed(() => {
 .ov-auto input {
   cursor: pointer;
   accent-color: var(--ci-primary);
+}
+
+/* 数据摘要条 */
+.ov-data-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 8px 16px;
+  background: var(--ci-surface);
+  border: 1px solid var(--ci-border);
+  border-radius: var(--r-md);
+  font-size: 12px;
+  color: var(--ci-text-2);
+  animation: ci-fade-up var(--dur) var(--ease) both;
+}
+
+.data-bar-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.data-bar-icon {
+  color: var(--ci-primary);
+}
+
+.data-bar-label {
+  color: var(--ci-text-3);
+  font-size: 11px;
+}
+
+.data-bar-value {
+  font-weight: 600;
+  color: var(--ci-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.data-bar-sep {
+  opacity: 0.2;
 }
 
 /* KPI 卡 */

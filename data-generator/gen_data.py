@@ -128,7 +128,7 @@ MEAL_CROSS_POINTS = (12 * 60, 17 * 60 + 30, 18 * 60 + 40)   # 判断"跨餐占�
 @dataclass
 class GenConfig:
     seed: int = 20260922
-    students: int = 200
+    students: int = 2000
     start: date = date(2026, 5, 1)
     days: int = 30
     target_consumption: int = 0          # >0 时自动延长 days 达到该规模

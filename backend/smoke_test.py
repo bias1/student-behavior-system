@@ -11,8 +11,8 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
+import uuid
 
 from app import create_app
 
@@ -53,8 +53,16 @@ CASES = [
     ("GET", "/api/warning/list?rule_code=CONSUME_DROP&size=5", None, ["items"]),
     ("GET", "/api/warning/list?size=5", None, ["total", "items"]),
     ("GET", "/api/warning/list?status=0&level=2", None, ["items"]),
-    ("GET", "/api/warning/stats", None, ["total", "by_type", "by_rule", "trend"]),
+    ("GET", "/api/warning/stats", None,
+     ["total", "by_type", "by_rule", "trend", "by_workflow", "disclaimer"]),
     ("GET", "/api/warning/rules", None, None),                       # 返回 list，无 dict 字段
+    # 阶段 4：五态工作流 / 信号类别筛选，规则级统计（均为只读，不改动预警数据）
+    ("GET", "/api/warning/list?workflow_state=0&size=5", None, ["items"]),
+    ("GET", "/api/warning/list?signal_kind=need_verification&size=5", None, ["items"]),
+    ("GET", "/api/warning/list?signal_kind=__bad__", None, None),     # 非法 signal_kind 期望 400
+    ("GET", "/api/warning/list?workflow_state=9", None, None),        # 非法工作流态期望 400
+    ("GET", "/api/warning/rule-stats", None,
+     ["items", "summary.verified_coverage", "accuracy_note", "disclaimer"]),
     # 认证探活入例（匿名白名单）；登录/401 拦截另外在主循环前做前置校验
     ("GET", "/api/auth/status", None, ["enabled"]),
     # 手肘法：默认按总纲要求扫 K=2..8，输出 SSE 曲线
@@ -71,6 +79,15 @@ CASES = [
     ("GET", "/api/clustering/members?cluster=0&features=core", None, ["items", "feature_set"]),
     ("GET", "/api/clustering/table?k=4&features=core&limit=20", None,
      ["columns", "column_labels", "items", "total"]),
+    # 阶段 2：导入批次 / 异步作业列表（只读，不提交作业以免产生异步负载与数据残留）
+    ("GET", "/api/import/jobs?size=5", None, ["total", "items", "page", "size"]),
+    ("GET", "/api/jobs?size=5", None, ["total", "items", "page", "size"]),
+    # 阶段 3：可复现算法实验 / IsolationForest 聚合异常实验（只读、子采样、短窗口）
+    ("GET", "/api/clustering/experiment?cap=800&k=4&k_min=2&k_max=6&days=30", None,
+     ["meta.random_seed", "k_sweep.k", "stability.seed.mean_ari",
+      "feature_comparison", "minibatch.runtime_ms", "disclaimer"]),
+    ("GET", "/api/clustering/iforest?days=30", None,
+     ["aggregate_only", "score_distribution", "outlier_counts", "disclaimer"]),
     ("GET", "/__not_exist", None, None),                            # 期望 404
 ]
 
@@ -85,19 +102,52 @@ def _has(data, path: str) -> bool:
     return True
 
 
+def _ensure_smoke_user(app):
+    """登录守卫生产化后旁路已移除：为冒烟脚本在本地库临时创建一个
+    拥有全部角色（4 角色权限并集=全 10 个权限）+ 全校数据范围的专用用户，
+    跑完在 finally 里清理（只删自己创建的行，不碰任何现有数据）。"""
+    from api.auth import make_password_hash
+    from models import SystemUser, UserRole, UserStudentScope, db
+
+    with app.app_context():
+        username = f"smoke_{uuid.uuid4().hex[:10]}"
+        password = uuid.uuid4().hex          # 随机口令，仅本次登录用，不落任何日志
+        u = SystemUser(username=username,
+                       password_hash=make_password_hash(password, iterations=1_000),
+                       display_name="冒烟测试专用", status=1)
+        db.session.add(u)
+        db.session.flush()
+        for rc in ("system_admin", "counselor", "analyst", "auditor"):
+            db.session.add(UserRole(user_id=u.id, role_code=rc))
+        # '*' = 显式全校授权，使所有范围过滤均放行，冒烟才能跑遍全量接口
+        db.session.add(UserStudentScope(user_id=u.id, scope_type="*", scope_value="*",
+                                        granted_by="smoke"))
+        db.session.commit()
+        return u.id, username, password
+
+
+def _cleanup_smoke_user(app, uid):
+    """删除临时冒烟用户及其会话（先删会话再删用户：roles/scopes 由 ORM 级联）。"""
+    try:
+        with app.app_context():
+            from models import LoginSession, SystemUser, db
+            LoginSession.query.filter_by(user_id=uid).delete(synchronize_session=False)
+            u = db.session.get(SystemUser, uid)
+            if u is not None:
+                db.session.delete(u)
+            db.session.commit()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] 冒烟用户清理失败（不影响结果）：{exc}")
+
+
 def main() -> int:
     app = create_app()
     client = app.test_client()
     passed = failed = 0
     sid = None
 
-    # 登录守卫适配：冒烟脚本不"先登录再跑全量"，走 API_ADMIN_TOKEN 服务旁路；
-    # .env 未配置时临时注入一个，保证 AUTH_ENABLED=1 下所有用例不受 401 干扰
-    bypass = app.config.get("API_ADMIN_TOKEN") or f"smoke-{os.getpid()}"
-    app.config["API_ADMIN_TOKEN"] = bypass
-    headers = {"X-API-Token": bypass}
-
-    # 前置校验 1：未认证请求必须被拦（只有 AUTH_ENABLED=0 的旧演示模式才允许匿名读）
+    # 前置校验 1：未登录请求必须被拦（旁路已彻底移除，不能再靠 X-API-Token 绕过）
+    headers: dict = {}
     anon = client.get("/api/warning/list")
     if app.config.get("AUTH_ENABLED"):
         ok_guard = anon.status_code == 401
@@ -106,20 +156,37 @@ def main() -> int:
         passed += ok_guard
         failed += not ok_guard
     else:
-        print(f"[SKIP] AUTH_ENABLED=0：匿名读放行（旧演示模式），当前 -> {anon.status_code}")
-    # 前置校验 2：能用配置的明文凭据登录就拿 token（配了哈希时跳过，不阻断冒烟）
-    if app.config.get("AUTH_PASSWORD_HASH"):
-        print("[SKIP] 登录接口用例：配了 AUTH_PASSWORD_HASH，明文回退路径不参与登录")
-    else:
-        lr = client.post("/api/auth/login", json={
-            "username": app.config.get("AUTH_USERNAME"),
-            "password": app.config.get("AUTH_PASSWORD"),
-        })
-        ok_login = lr.status_code == 200 and bool((lr.get_json().get("data") or {}).get("token"))
+        print(f"[SKIP] AUTH_ENABLED=0：匿名读放行（离线演示模式），当前 -> {anon.status_code}")
+
+    # 前置校验 2：真实登录拿会话 Cookie（写操作还需 X-CSRF-Token）
+    try:
+        uid, uname, pwd = _ensure_smoke_user(app)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[FAIL] 无法创建冒烟用户（数据库/迁移未就绪？）：{type(exc).__name__}: {exc}")
+        print("       请先执行 alembic upgrade head 并确认 DB 连接可用，再跑冒烟。")
+        return 1
+    try:
+        lr = client.post("/api/auth/login", json={"username": uname, "password": pwd})
+        ok_login = lr.status_code == 200
+        if ok_login:
+            ck = client.get_cookie("sb_csrf")
+            headers = {"X-CSRF-Token": ck.value} if ck else {}
         print(f"[{'PASS' if ok_login else 'FAIL'}] 登录：POST /api/auth/login -> "
-              f"{lr.status_code}（期望 200 且返 token）")
+              f"{lr.status_code}（期望 200，下发 httpOnly 会话 Cookie）")
         passed += ok_login
         failed += not ok_login
+    finally:
+        pass
+
+    # 前置校验 3（阶段 6）：响应必须回写 X-Request-Id，合法的 upstream ID 应被原样透传
+    rid_in = "smoke-trace-123_x"
+    hr = client.get("/api/health", headers={"X-Request-Id": rid_in})
+    rid_out = hr.headers.get("X-Request-Id")
+    ok_rid = rid_out == rid_in
+    print(f"[{'PASS' if ok_rid else 'FAIL'}] 请求追踪：GET /api/health 响应 X-Request-Id 透传 -> "
+          f"{rid_out!r}（期望 {rid_in!r}）")
+    passed += ok_rid
+    failed += not ok_rid
 
     with app.app_context():
         from models import Student
@@ -143,8 +210,8 @@ def main() -> int:
             expect_http = 404
         elif path == "/api/overview/groups?dim=wrong" or path == "/__not_exist":
             expect_http = 400 if "dim=wrong" in path else 404
-        elif "scope=wrong" in path:
-            expect_http = 400                                   # 非法 scope 必须被拦住
+        elif "scope=wrong" in path or "signal_kind=__bad__" in path or "workflow_state=9" in path:
+            expect_http = 400                                   # 非法入参必须被拦住
         else:
             expect_http = 200
 
@@ -182,6 +249,7 @@ def main() -> int:
             print(f"        {preview[:300]}")
     print("=" * 92)
     print(f"结果：{passed} 通过 / {failed} 失败")
+    _cleanup_smoke_user(app, uid)
     return 1 if failed else 0
 
 

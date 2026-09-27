@@ -62,6 +62,11 @@ class Config:
 
     SECRET_KEY = os.getenv("SECRET_KEY", "student-behavior-dev")
 
+    # 运行环境标识：security_check/validate_config 用 prod 判定决定是否 fail-fast。
+    # 提前定义，供下方 SESSION_COOKIE_SECURE 等按环境推导的配置使用。
+    APP_ENV = os.getenv("APP_ENV", "dev")
+    IS_PROD = APP_ENV.lower() == "prod"
+
     # 密码需 URL 转义，防止密码里出现 @ : / 等字符导致 URI 解析错误
     SQLALCHEMY_DATABASE_URI = (
         f"mysql+pymysql://{DB_USER}:{quote_plus(DB_PASSWORD)}"
@@ -84,21 +89,29 @@ class Config:
     API_PREFIX = "/api"
     JSON_SORT_KEYS = False            # 保持趋势数据的日期顺序，不能按 key 排序
 
-    # ---------------- 登录守卫（轻量，非完整 RBAC，见 api/auth.py） ----------------
-    # 默认开启：除 /api/health 与 /api/auth/login|status 外，所有 /api/* 必须带
-    # Authorization: Bearer <token>。纯离线演示可 AUTH_ENABLED=0 整体关闭。
+    # ---------------- 认证与会话（阶段 1 生产化：httpOnly Cookie 会话 + CSRF） ----------------
+    # 认证默认强制开启；AUTH_ENABLED=0 仅允许在非 prod 环境下用于离线演示。
+    # 会话不再用无状态 Bearer token，而是 LoginSession 表 + sha256(令牌) 存库，
+    # 每次请求实时查库——禁用账号/退出/改密/管理员踢出均即时生效（可吊销）。
     AUTH_ENABLED = os.getenv("AUTH_ENABLED", "1") == "1"
-    # 注意用 `or` 回退而不是 getenv 默认值：.env 里写 AUTH_PASSWORD=（空值）时 getenv
-    # 返回空串，若直接拿空串参与比对，compare_digest("", "") 为真，
-    # 等于任何人可用空密码登 admin —— 空值一律回退默认口令而不是参与比对
-    AUTH_USERNAME = os.getenv("AUTH_USERNAME") or "admin"
-    AUTH_PASSWORD = os.getenv("AUTH_PASSWORD") or "admin123"
-    AUTH_PASSWORD_HASH = os.getenv("AUTH_PASSWORD_HASH") or ""
-    AUTH_TOKEN_TTL = int(os.getenv("AUTH_TOKEN_TTL", "43200"))    # 登录态有效期（秒），默认 12h
+    SESSION_TTL = int(os.getenv("SESSION_TTL", "28800"))            # 会话有效期（秒），默认 8h
+    # Secure Cookie：prod 强制 True（必须 HTTPS），dev 默认 False 便于 http 本地联调
+    SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE",
+                                      "1" if IS_PROD else "0") == "1"
+    # 登录失败限流：连续失败达阈值锁定账号一段时间（落库，多进程/重启仍生效）
+    LOGIN_MAX_FAILURES = int(os.getenv("LOGIN_MAX_FAILURES", "5"))
+    LOGIN_LOCKOUT_SECONDS = int(os.getenv("LOGIN_LOCKOUT_SECONDS", "900"))
+    # 审计日志保留天数（超期由 cli_users.py purge-audit 清理/匿名化）
+    AUDIT_RETENTION_DAYS = int(os.getenv("AUDIT_RETENTION_DAYS", "365"))
+    # 聚合统计最小群体规模：分组样本数 < 该值时合并为“其他”，防小样本反推个人
+    STATS_MIN_COHORT = int(os.getenv("STATS_MIN_COHORT", "5"))
+    # 首次启动引导管理员：仅用于创建第一个 system_admin，口令走环境变量、不落 Git。
+    # prod 下若既无 BOOTSTRAP_ADMIN_PASSWORD 又无已存在用户，validate_config 会 fail-fast。
+    BOOTSTRAP_ADMIN_USERNAME = os.getenv("BOOTSTRAP_ADMIN_USERNAME") or "admin"
+    BOOTSTRAP_ADMIN_PASSWORD = os.getenv("BOOTSTRAP_ADMIN_PASSWORD") or ""
 
-    # ---------------- 写操作旁路凭证 ----------------
-    # 供冒烟脚本/定时任务使用的服务级 token（X-API-Token 头），与登录 token 二选一即可；
-    # AUTH_ENABLED=0 时退化为旧的"仅写接口要求 token"行为。
+    # 历史遗留字段：保留声明仅为兼容旧 .env 读取，不再参与任何认证逻辑（旁路已彻底移除）。
+    # 若 prod 环境检测到设置了 API_ADMIN_TOKEN，validate_config 会直接拒绝启动。
     API_ADMIN_TOKEN = os.getenv("API_ADMIN_TOKEN", "")
 
     # ---------------- 分析参数 ----------------
@@ -107,21 +120,49 @@ class Config:
     ANALYSIS_DEFAULT_DAYS = int(os.getenv("ANALYSIS_DEFAULT_DAYS", "30")) # 默认统计窗口
     WARNING_TOP_N = int(os.getenv("WARNING_TOP_N", "10"))
 
+    # ---------------- 数据导入（阶段 2）----------------
+    # 单次 CSV 上传体积上限（字节），默认 50MB；超出 Flask 直接回 413，
+    # 避免超大文件把导入请求线程长时间占住 / 打满内存（导入在服务层同步分批处理）。
+    MAX_CONTENT_LENGTH = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+    # 异步分析作业默认超时（秒）与允许提交的最大超时
+    JOB_DEFAULT_TIMEOUT = int(os.getenv("JOB_DEFAULT_TIMEOUT", "300"))
+    JOB_MAX_TIMEOUT = int(os.getenv("JOB_MAX_TIMEOUT", "1800"))
+    # 是否在 create_app 时启动后台作业 worker（单线程）。测试可用 START_WORKER=0 关闭。
+    START_WORKER = os.getenv("START_WORKER", "1") == "1"
+
     # ---------------- 运行 ----------------
     HOST = os.getenv("FLASK_RUN_HOST", "127.0.0.1")
     PORT = int(os.getenv("FLASK_RUN_PORT", "5000"))
     # 调试默认关：裸跑 python app.py 是"安全但少了自动重载"，本地开发在 .env 写 FLASK_DEBUG=1
     DEBUG = os.getenv("FLASK_DEBUG", "0") == "1"
-    # 环境标识：security_check 用它区分"生产强告警"与"本地演示弱提醒"
-    APP_ENV = os.getenv("APP_ENV", "dev")
+
+    # ---------------- 日志（阶段 6：结构化日志 + 脱敏）----------------
+    # LOG_LEVEL：服务日志级别（DEBUG/INFO/WARNING/ERROR）；生产默认 INFO
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    # LOG_FORMAT：json=一行一条 JSON（采集端友好，默认）；text=人类可读回退
+    LOG_FORMAT = os.getenv("LOG_FORMAT", "json")
+
+
+class TestConfig(Config):
+    """测试/预生产隔离环境：非 prod，不触发 fail-fast；会话 Cookie 不强制 Secure，
+    便于在 http 测试域/本机跑集成用例；日志走 JSON 与生产一致以验证可解析性。"""
+    APP_ENV = "test"
+    IS_PROD = False
+    DEBUG = False
+    TESTING = True
+    SESSION_COOKIE_SECURE = False
+    START_WORKER = os.getenv("START_WORKER", "0") == "1"   # 测试默认不起后台 worker
 
 
 class ProdConfig(Config):
     APP_ENV = "prod"
+    IS_PROD = True
     DEBUG = False
+    # 生产环境会话 Cookie 必须 Secure（HTTPS），不允许被 env 关掉
+    SESSION_COOKIE_SECURE = True
 
 
-config_map = {"dev": Config, "prod": ProdConfig}
+config_map = {"dev": Config, "test": TestConfig, "prod": ProdConfig}
 
 
 def get_config(env: str | None = None) -> type[Config]:
@@ -131,27 +172,62 @@ def get_config(env: str | None = None) -> type[Config]:
 def security_check(cfg) -> list[str]:
     """
     启动时的配置自查，返回告警文本列表（由 app.py 记入日志）。
-    只提醒不阻断：本地演示需要默认配置能直接跑起来，
-    但 APP_ENV=prod 时每一项默认值都必须换掉，否则告警会在日志里持续可见。
+    只提醒不阻断（非 prod）：本地演示需要默认配置能直接跑起来；
+    prod 环境的不安全配置由 validate_config() 直接拒绝启动。
     """
     warns: list[str] = []
     prod = str(cfg.get("APP_ENV", "dev")).lower() == "prod"
     if cfg.get("DB_PASSWORD") == "123456":
         warns.append("数据库使用代码默认口令，请在 backend/.env 中设置 DB_PASSWORD"
                      + ("（生产模式禁止！）" if prod else ""))
+    if cfg.get("DB_USER") == "root":
+        warns.append("数据库使用 root 账号，部署时应创建最小权限专用账号"
+                     + ("（生产模式禁止！）" if prod else ""))
     if cfg.get("SECRET_KEY") == "student-behavior-dev":
         warns.append("SECRET_KEY 为默认值，生产环境请通过环境变量覆盖为随机字符串")
     if cfg.get("CORS_ORIGINS") == "*":
         warns.append("CORS 全域名开放，部署时请收敛为前端实际域名")
-    if cfg.get("AUTH_ENABLED"):
-        if not cfg.get("AUTH_PASSWORD_HASH"):
-            if cfg.get("AUTH_PASSWORD") == "admin123":
-                warns.append("登录使用默认口令 admin/admin123，公网部署必须改"
-                             + ("（生产模式禁止！）" if prod else "")
-                             + "；建议用 api.auth.make_password_hash 生成 AUTH_PASSWORD_HASH")
-            else:
-                warns.append("AUTH_PASSWORD 为明文口令，建议改用 AUTH_PASSWORD_HASH 存哈希")
-    else:
-        warns.append("AUTH_ENABLED=0：全部读接口匿名可访问，仅适合离线演示；"
-                     "至少设置 API_ADMIN_TOKEN 保护写接口")
+    if not cfg.get("AUTH_ENABLED"):
+        warns.append("AUTH_ENABLED=0：全部读接口匿名可访问，仅适合离线演示（生产模式禁止）")
     return warns
+
+
+class ProductionConfigError(RuntimeError):
+    """prod 配置不合规：启动必须失败（fail-fast），绝不带着不安全配置上线。"""
+
+
+def validate_config(cfg) -> None:
+    """
+    仅在 APP_ENV=prod 时执行（非 prod 直接返回）。任一硬红线命中即抛
+    ProductionConfigError，由 create_app 阻断启动：
+      - 默认/空 SECRET_KEY
+      - 数据库默认口令或 root 账号
+      - 关闭认证（AUTH_ENABLED=0）
+      - 开启调试模式
+      - CORS 全域名（*）
+      - 仍配置了已废弃的管理旁路凭证 API_ADMIN_TOKEN
+      - 会话 Cookie 未启用 Secure（HTTPS 前置）
+    """
+    if str(cfg.get("APP_ENV", "dev")).lower() != "prod":
+        return
+    errors: list[str] = []
+    secret = cfg.get("SECRET_KEY")
+    if not secret or secret == "student-behavior-dev":
+        errors.append("SECRET_KEY 为空或为默认值，prod 必须注入随机密钥（不进 Git）")
+    if cfg.get("DB_PASSWORD") == "123456" or not cfg.get("DB_PASSWORD"):
+        errors.append("数据库使用默认/空口令，prod 必须设置强口令")
+    if cfg.get("DB_USER") == "root":
+        errors.append("prod 禁止使用数据库 root 账号，请改用最小权限专用账号")
+    if not cfg.get("AUTH_ENABLED"):
+        errors.append("prod 禁止关闭认证（AUTH_ENABLED=0）")
+    if cfg.get("DEBUG"):
+        errors.append("prod 禁止开启调试模式（FLASK_DEBUG）")
+    if str(cfg.get("CORS_ORIGINS", "")).strip() == "*":
+        errors.append("prod 禁止 CORS 全域名开放，必须为可信来源列表")
+    if cfg.get("API_ADMIN_TOKEN"):
+        errors.append("prod 检测到已废弃的管理旁路凭证 API_ADMIN_TOKEN，必须移除")
+    if not cfg.get("SESSION_COOKIE_SECURE"):
+        errors.append("prod 会话 Cookie 必须 Secure（系统仅经 HTTPS 提供）")
+    if errors:
+        raise ProductionConfigError(
+            "生产环境安全配置自检未通过，拒绝启动：\n  - " + "\n  - ".join(errors))

@@ -13,11 +13,13 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { Layers, Maximize2, RefreshCw } from 'lucide-vue-next'
+import { FlaskConical, Layers, Maximize2, RefreshCw } from 'lucide-vue-next'
 import { ClusteringApi } from '@/api'
 import { dataSpan, windowOptions } from '@/utils/window'
 import { PALETTE } from '@/styles/palette'
+import { useSession } from '@/composables/useSession'
 import BaseChart from '@/components/BaseChart.vue'
+import ClusterExperimentPanel from '@/components/ClusterExperimentPanel.vue'
 import UCard from '@/components/ui/UCard.vue'
 import USegmented from '@/components/ui/USegmented.vue'
 import USelect from '@/components/ui/USelect.vue'
@@ -30,6 +32,11 @@ import USkeleton from '@/components/ui/USkeleton.vue'
 import UEmptyState from '@/components/ui/UEmptyState.vue'
 
 const router = useRouter()
+const session = useSession()
+
+// 阶段 3：算法实验面板仅对拥有 clustering:run 的授权分析人员开放（最终授权在后端）
+const canRunExperiment = computed(() => session.hasPerm('clustering:run'))
+const experimentOpen = ref(false)
 
 // 窗口选项按真实数据跨度生成（“全部”不再是硬编码 90 天）
 const span = ref(0)
@@ -62,13 +69,13 @@ async function load() {
 
 watch([k, featureSet], load)
 watch(days, load)
-onMounted(async () => {
-  span.value = await dataSpan()
-  if (span.value > 0 && days.value > span.value) {
-    days.value = span.value
-    return                     // watch(days) 会触发 load，不重复算一轮聚类
-  }
-  load()
+onMounted(() => {
+  load()                       // 首屏并行：不等 meta，后端会把窗口钉在数据范围内，结果与全部跨度一致
+  dataSpan().then((s) => {
+    span.value = s
+    // 跨度比当前选项小时钉回真实窗口，watch(days) 会再拉一次；聚类结果有 TTL 缓存，额外一轮近乎零成本
+    if (s > 0 && days.value > s) days.value = s
+  })
 })
 
 /* ---------------- 群体分布柱状图 ---------------- */
@@ -115,7 +122,10 @@ const scatterOption = computed(() => {
     xAxis: { type: 'value', name: 'PC1', scale: true },
     yAxis: { type: 'value', name: 'PC2', scale: true },
     series: cs.map((c, i) => ({
-      name: c.label, type: 'scatter', symbolSize: 7,
+      name: c.label, type: 'scatter', symbolSize: 5,
+      // 万人规模下逐帧全量绘制会卡：large 切到 progressive 分批渲染，
+      // 只在点数超阈值时生效，200 人演示数据行为不变
+      large: true, largeThreshold: 2000,
       itemStyle: { color: PALETTE[i % PALETTE.length], opacity: 0.8 },
       data: pts.filter((p) => p.cluster === c.cluster).map((p) => [p.x, p.y, p.name || p.student_id]),
     })),
@@ -180,6 +190,9 @@ const memberColumns = computed(() => [
       <USelect v-model="k" :options="K_OPTS" placeholder="K 值" width="80px" />
       <USelect v-model="featureSet" :options="FEATURE_OPTS" placeholder="特征集" width="136px" />
       <div class="sg-bar__right">
+        <UButton v-if="canRunExperiment" variant="ghost" size="sm" @click="experimentOpen = true">
+          <FlaskConical :size="13" /> 算法实验
+        </UButton>
         <UButton variant="ghost" size="sm" :loading="loading" @click="load">
           <RefreshCw :size="13" /> 重新计算
         </UButton>
@@ -245,6 +258,14 @@ const memberColumns = computed(() => [
         仅用于观察簇分离程度，不参与聚类计算。右图：K=2~8 的 SSE 与轮廓系数，
         最优 K 值按"SSE 边际收益明显下降 + 簇可解释性"确定。
       </p>
+    </UModal>
+
+    <!-- 算法实验 Modal（阶段 3，仅 clustering:run 可用） -->
+    <UModal v-model:open="experimentOpen" title="聚类算法实验（可复现）" width="1080px">
+      <ClusterExperimentPanel
+        v-if="experimentOpen"
+        :params="{ k, features: featureSet, days, k_min: 2, k_max: 8, cap: 3000 }"
+      />
     </UModal>
 
     <!-- 成员 Drawer -->
@@ -365,7 +386,7 @@ const memberColumns = computed(() => [
   height: 3px;
   margin-bottom: 6px;
   border-radius: 2px;
-  background: rgba(255,255,255,0.06);
+  background: var(--ci-chip);
   overflow: hidden;
 }
 

@@ -15,10 +15,13 @@ def register_blueprints(app: Flask) -> None:
     from api.auth import bp as auth_bp
     from api.clustering import bp as clustering_bp
     from api.consumption import bp as consumption_bp
+    from api.import_api import bp as import_bp
+    from api.jobs import bp as jobs_bp
     from api.library import bp as library_bp
     from api.overview import bp as overview_bp
     from api.student import bp as student_bp
     from api.warning import bp as warning_bp
 
-    for bp in (auth_bp, overview_bp, consumption_bp, library_bp, student_bp, clustering_bp, warning_bp):
+    for bp in (auth_bp, overview_bp, consumption_bp, library_bp, student_bp, clustering_bp,
+               warning_bp, import_bp, jobs_bp):
         app.register_blueprint(bp)

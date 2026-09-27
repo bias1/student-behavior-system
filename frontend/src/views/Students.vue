@@ -58,6 +58,7 @@ async function loadList() {
   try {
     const params = { page: page.value, size: size.value }
     if (keyword.value) params.keyword = keyword.value
+    if (collegeFilter.value) params.college = collegeFilter.value
     const d = await StudentApi.list(params)
     items.value = d.items || []
     total.value = d.total || 0
@@ -86,16 +87,51 @@ const columns = [
 function goProfile(sid) {
   if (sid) router.push(`/student/${sid}`)
 }
+
+/* 导出 CSV（当前页） */
+function exportCsv() {
+  const cols = ['学号', '姓名', '性别', '学院', '专业', '班级', '年级', '宿舍']
+  const rows = [cols.join(',')]
+  items.value.forEach((r) => {
+    rows.push([
+      r.student_id, r.name, r.gender_text || '--',
+      r.college, r.major, r.class_name, r.grade_year, r.dorm_building,
+    ].join(','))
+  })
+  const blob = new Blob(['\ufeff' + rows.join('\n')], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `students_page${page.value}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+}
 </script>
 
 <template>
   <div class="students-page">
-    <UCard title="学生列表" :subtitle="`共 ${total} 人`">
+    <UCard title="学生列表" :subtitle="`共 ${total} 人`" padded>
       <template #extra>
-        <UButton variant="ghost" size="sm">
+        <UButton variant="ghost" size="sm" @click="exportCsv">
           <Download :size="13" /> 导出
         </UButton>
       </template>
+
+      <!-- 数据摘要 -->
+      <div v-if="total > 0" class="st-summary">
+        <div class="st-stat">
+          <span class="st-stat__num">{{ total }}</span>
+          <span class="st-stat__lbl">学生总数</span>
+        </div>
+        <div class="st-stat">
+          <span class="st-stat__num">{{ COLLEGES.length }}</span>
+          <span class="st-stat__lbl">学院数</span>
+        </div>
+        <div class="st-stat">
+          <span class="st-stat__num">{{ GRADES.length }}</span>
+          <span class="st-stat__lbl">年级数</span>
+        </div>
+      </div>
 
       <!-- 搜索栏 -->
       <div class="st-filters">
@@ -108,10 +144,25 @@ function goProfile(sid) {
         >
           <template #prefix><Search :size="13" /></template>
         </UInput>
+        <USelect
+          v-model="collegeFilter"
+          :options="COLLEGES"
+          placeholder="学院"
+          width="180px"
+          filterable
+          @change="search"
+        />
+        <USelect
+          v-model="gradeFilter"
+          :options="GRADES"
+          placeholder="年级"
+          width="110px"
+          @change="search"
+        />
         <UButton variant="primary" size="sm" @click="search">查询</UButton>
         <UButton
           variant="ghost" size="sm"
-          @click="keyword = ''; page = 1; loadList()"
+          @click="keyword = ''; collegeFilter = ''; gradeFilter = ''; page = 1; loadList()"
         >重置</UButton>
       </div>
 
@@ -133,8 +184,8 @@ function goProfile(sid) {
             <span class="st-name"><User :size="11" /> {{ row.name }}</span>
           </template>
           <template #cell-gender="{ row }">
-            <UBadge :tone="row.gender === '男' ? 'primary' : 'neutral'">
-              {{ row.gender || '--' }}
+            <UBadge :tone="row.gender === 1 ? 'primary' : 'neutral'">
+              {{ row.gender_text || '--' }}
             </UBadge>
           </template>
           <template #cell-action="{ row }">
@@ -167,6 +218,35 @@ function goProfile(sid) {
   align-items: center;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+/* 数据摘要条 */
+.st-summary {
+  display: flex;
+  gap: 24px;
+  padding: 10px 16px;
+  margin-bottom: 12px;
+  background: var(--ci-surface-2);
+  border: 1px solid var(--ci-border);
+  border-radius: var(--r-md);
+}
+
+.st-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.st-stat__num {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--ci-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.st-stat__lbl {
+  font-size: 11px;
+  color: var(--ci-text-3);
 }
 
 .st-table { min-height: 200px; }

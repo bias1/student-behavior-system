@@ -11,17 +11,105 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import functools
+import threading
+import time
+from typing import Any, Callable, Dict, List
 
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
 from models import db
+from security import Scope
 from utils import data_range
 
 WEEKDAYS_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 HOURS = list(range(24))
+
+
+def _scope_where(scope: "Scope | None", col: str = "student_id") -> tuple[str, dict]:
+    """把当前用户数据范围下推为 SQL 片段 + 绑定参数（None/全校=不过滤，空范围=永假）。
+    各统计函数把 scope 作为入参 → ttl_cache 的 key 含 Scope 哈希，自动做到跨用户不串缓存。"""
+    sc = scope if scope is not None else Scope(all=True)
+    return sc.sql_filter(col=col)
+
+# =============================================================================
+# 统计结果 TTL 缓存
+# 本机 MySQL 对 77 万行消费表的单次全窗口聚合就要 3~12s，万人规模下靠 SQL
+# 微调无法首屏达标；而模拟数据是静态批次导入的，短 TTL 结果缓存对这个演示
+# 系统是最对症的药（与 clustering 的 _CACHE、utils.data_range 同一思路）。
+# 预警 scan/refresh 会改变 warning 表 → 写接口后用 clear_stats_cache() 定向失效。
+# =============================================================================
+
+_STATS_TTL = 300
+_STAT_CACHE: Dict[str, Dict[str, Any]] = {}
+_STAT_LOCK = threading.Lock()
+# stale-while-revalidate：已过期但正在后台重算的 key，避免并发请求重复拉起重查询
+_REFRESHING: set = set()
+
+
+def _stat_store(key: str, data: Any) -> None:
+    with _STAT_LOCK:
+        _STAT_CACHE[key] = {"data": data, "exp": time.time() + _STATS_TTL}
+        if len(_STAT_CACHE) > 96:            # 防不同窗口组合把内存撑爆，淘汰最早到期的
+            oldest = min(_STAT_CACHE, key=lambda x: _STAT_CACHE[x]["exp"])
+            _STAT_CACHE.pop(oldest, None)
+
+
+def _stat_refresh(fn: Callable, args: tuple, kw: dict, key: str, app_obj: Any) -> None:
+    """后台线程重算并写回缓存；失败保留旧值（下次过期再重试），不影响接口可用"""
+    try:
+        if app_obj is not None:
+            app_obj.app_context().push()
+        _stat_store(key, fn(*args, **kw))
+    except Exception:  # noqa: BLE001  失败保留旧值，下次过期再重试，但留痕便于排查
+        import traceback
+        traceback.print_exc()
+    finally:
+        with _STAT_LOCK:
+            _REFRESHING.discard(key)
+
+
+def clear_stats_cache(prefixes: tuple = ()) -> int:
+    """清统计缓存；prefixes 非空时只删匹配函数名前缀的条目（如 ('overview','summary')）"""
+    with _STAT_LOCK:
+        keys = [k for k in _STAT_CACHE if not prefixes or k.startswith(prefixes)]
+        for k in keys:
+            _STAT_CACHE.pop(k, None)
+        return len(keys)
+
+
+def ttl_cache(fn: Callable) -> Callable:
+    """按 (函数名+参数) 缓存返回值；参数必须是可哈希的标量（现有接口全部满足）。
+    过期策略是 stale-while-revalidate：命中过期条目时立即返回旧值（用户永远秒级
+    响应），同时后台线程重算写回；只有从未缓存过的 key 才同步计算（由启动预热兑底）。"""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kw):
+        key = fn.__name__ + "|" + repr(args) + "|" + repr(sorted(kw.items()))
+        with _STAT_LOCK:
+            hit = _STAT_CACHE.get(key)
+            if hit:
+                if time.time() < hit["exp"]:
+                    return hit["data"]
+                # 过期：给旧值 + 拉起后台刷新（同一 key 只允许一个在算）
+                if key not in _REFRESHING:
+                    _REFRESHING.add(key)
+                    try:
+                        from flask import current_app
+                        app_obj = current_app._get_current_object()
+                    except Exception:  # noqa: BLE001  非请求上下文（如预热线程）无活动 app
+                        app_obj = None
+                    threading.Thread(target=_stat_refresh,
+                                     args=(fn, args, kw, key, app_obj),
+                                     daemon=True, name="stat-refresh").start()
+                return hit["data"]
+        data = fn(*args, **kw)
+        _stat_store(key, data)
+        return data
+
+    return wrapper
 
 
 def _read(sql: str, params: Dict[str, Any] | None = None) -> pd.DataFrame:
@@ -33,10 +121,12 @@ def _read(sql: str, params: Dict[str, Any] | None = None) -> pd.DataFrame:
 # 1. 总览指标
 # =============================================================================
 
-def overview() -> Dict[str, Any]:
-    """大屏顶部核心指标卡：学生数、消费总额、日均图书馆时长等"""
+@ttl_cache
+def overview(scope: "Scope | None" = None) -> Dict[str, Any]:
+    """大屏顶部核心指标卡：学生数、消费总额、日均图书馆时长等（均限当前用户数据范围）"""
     start, end = data_range()
-    sql = """
+    wf, wp = _scope_where(scope)          # consumption / library_record / warning / student 都有 student_id
+    sql = f"""
         SELECT COUNT(DISTINCT student_id)                              AS students,
                COUNT(*)                                                 AS records,
                ROUND(SUM(amount), 2)                                    AS total_amount,
@@ -46,11 +136,11 @@ def overview() -> Dict[str, Any]:
                                                                         AS avg_daily_amount,
                MIN(DATE(consumed_at))                                   AS c_start,
                MAX(DATE(consumed_at))                                   AS c_end
-        FROM consumption WHERE is_valid = 1
+        FROM consumption WHERE is_valid = 1{wf}
     """
-    c = _read(sql).iloc[0]
+    c = _read(sql, wp).iloc[0]
 
-    sql_lib = """
+    sql_lib = f"""
         SELECT COUNT(*)                                    AS visits,
                COUNT(DISTINCT student_id)                  AS students,
                ROUND(AVG(stay_minutes), 1)                 AS avg_stay,
@@ -60,18 +150,18 @@ def overview() -> Dict[str, Any]:
                ROUND(SUM(stay_minutes) / COUNT(DISTINCT student_id) /
                      (DATEDIFF(MAX(DATE(gate_in_time)), MIN(DATE(gate_in_time))) + 1) / 60, 2)
                                                            AS avg_daily_hours
-        FROM library_record WHERE is_valid = 1 AND stay_minutes IS NOT NULL
+        FROM library_record WHERE is_valid = 1 AND stay_minutes IS NOT NULL{wf}
     """
-    l = _read(sql_lib).iloc[0]
+    l = _read(sql_lib, wp).iloc[0]
 
     # 高峰时段：消费笔数最多的小时 / 进馆人数最多的小时
     peak_c = _read("SELECT HOUR(consumed_at) h, COUNT(*) n FROM consumption WHERE is_valid=1 "
-                   "GROUP BY h ORDER BY n DESC LIMIT 1")
+                   f"{wf} GROUP BY h ORDER BY n DESC LIMIT 1", wp)
     peak_l = _read("SELECT HOUR(gate_in_time) h, COUNT(*) n FROM library_record WHERE is_valid=1 "
-                   "GROUP BY h ORDER BY n DESC LIMIT 1")
+                   f"{wf} GROUP BY h ORDER BY n DESC LIMIT 1", wp)
 
-    warn = _read("SELECT COUNT(*) n, SUM(status=0) pending FROM warning")
-    stu = _read("SELECT COUNT(*) n FROM student").iloc[0]
+    warn = _read(f"SELECT COUNT(*) n, SUM(status=0) pending FROM warning WHERE 1=1{wf}", wp)
+    stu = _read(f"SELECT COUNT(*) n FROM student WHERE 1=1{wf}", wp).iloc[0]
 
     return {
         "student_count": int(stu["n"]),
@@ -97,29 +187,31 @@ def overview() -> Dict[str, Any]:
 # 2. 消费相关统计
 # =============================================================================
 
-def consumption_trend(start: str, end: str) -> Dict[str, Any]:
+@ttl_cache
+def consumption_trend(start: str, end: str, scope: "Scope | None" = None) -> Dict[str, Any]:
     """
     按天消费趋势：总额、笔数、人均笔数、在馆时长（叠加对比用）。
     缺失日期用 reindex 补 0，否则前端折线会在周末断线，看起来像数据丢失。
     """
+    wf, wp = _scope_where(scope)
     df = _read(
-        """
+        f"""
         SELECT DATE(consumed_at) d, ROUND(SUM(amount),2) amount, COUNT(*) records,
                COUNT(DISTINCT student_id) students
         FROM consumption
-        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY d ORDER BY d
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     lib = _read(
-        """
+        f"""
         SELECT DATE(gate_in_time) d, COUNT(*) visits, ROUND(SUM(stay_minutes),0) minutes
         FROM library_record
-        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY d
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     if len(df) == 0:
         return {"dates": [], "series": {}}
@@ -154,21 +246,23 @@ def consumption_trend(start: str, end: str) -> Dict[str, Any]:
     }
 
 
-def consumption_heatmap(start: str, end: str) -> Dict[str, Any]:
+@ttl_cache
+def consumption_heatmap(start: str, end: str, scope: "Scope | None" = None) -> Dict[str, Any]:
     """
     消费时段热力图：星期(7) × 小时(24) 的笔数与金额矩阵。
     MySQL WEEKDAY() 返回 0=周一，与前端 x 轴顺序一致；网格补 0 后再透视，
     否则 ECharts 会把缺值当 0 但颜色映射的 max 会算错。
     """
+    wf, wp = _scope_where(scope)
     df = _read(
-        """
+        f"""
         SELECT WEEKDAY(consumed_at) wd, HOUR(consumed_at) hh,
                COUNT(*) records, ROUND(SUM(amount),2) amount
         FROM consumption
-        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY wd, hh
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     full = pd.MultiIndex.from_product([range(7), HOURS], names=["wd", "hh"]).to_frame(index=False)
     df = full.merge(df, on=["wd", "hh"], how="left").fillna({"records": 0, "amount": 0})
@@ -191,36 +285,38 @@ def consumption_heatmap(start: str, end: str) -> Dict[str, Any]:
     }
 
 
-def consumption_category(start: str, end: str) -> Dict[str, Any]:
+@ttl_cache
+def consumption_category(start: str, end: str, scope: "Scope | None" = None) -> Dict[str, Any]:
     """消费类别占比：按商户类型 + 按餐段（meal_period 是数据库生成列）"""
+    wf, wp = _scope_where(scope)
     by_type = _read(
-        """
+        f"""
         SELECT merchant_type, COUNT(*) records, ROUND(SUM(amount),2) amount,
                ROUND(AVG(amount),2) avg_amount
         FROM consumption
-        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY merchant_type ORDER BY amount DESC
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     by_meal = _read(
-        """
+        f"""
         SELECT meal_period, COUNT(*) records, ROUND(SUM(amount),2) amount
         FROM consumption
         WHERE is_valid = 1 AND merchant_type = 1
-          AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+          AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY meal_period ORDER BY records DESC
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     by_top_merchant = _read(
-        """
+        f"""
         SELECT merchant_name, COUNT(*) records, ROUND(SUM(amount),2) amount
         FROM consumption
-        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY merchant_name ORDER BY records DESC LIMIT 10
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
 
     def with_pct(df: pd.DataFrame, key: str) -> List[Dict[str, Any]]:
@@ -251,17 +347,19 @@ def consumption_category(start: str, end: str) -> Dict[str, Any]:
 # 3. 图书馆相关统计
 # =============================================================================
 
-def library_trend(start: str, end: str) -> Dict[str, Any]:
+@ttl_cache
+def library_trend(start: str, end: str, scope: "Scope | None" = None) -> Dict[str, Any]:
     """图书馆人流趋势：按天的入馆人次、独立人数、日均在馆时长、高峰小时"""
+    wf, wp = _scope_where(scope)
     df = _read(
-        """
+        f"""
         SELECT DATE(gate_in_time) d, COUNT(*) visits, COUNT(DISTINCT student_id) students,
                ROUND(AVG(stay_minutes),1) avg_stay, ROUND(SUM(stay_minutes)/60,1) total_hours
         FROM library_record
-        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY d ORDER BY d
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     if len(df) == 0:
         return {"dates": [], "series": {}}
@@ -269,24 +367,24 @@ def library_trend(start: str, end: str) -> Dict[str, Any]:
     df = df.set_index(pd.DatetimeIndex(pd.to_datetime(df["d"]))).reindex(idx, fill_value=0)
 
     hourly = _read(
-        """
+        f"""
         SELECT WEEKDAY(gate_in_time) wd, HOUR(gate_in_time) hh, COUNT(*) n
         FROM library_record
-        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY wd, hh
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     full = pd.MultiIndex.from_product([range(7), HOURS], names=["wd", "hh"]).to_frame(index=False)
     grid = full.merge(hourly, on=["wd", "hh"], how="left").fillna({"n": 0})
 
     area = _read(
-        """
+        f"""
         SELECT area_name, COUNT(*) n FROM library_record
-        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY area_name ORDER BY n DESC LIMIT 8
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     return {
         "dates": [d.strftime("%Y-%m-%d") for d in idx],
@@ -312,14 +410,18 @@ def library_trend(start: str, end: str) -> Dict[str, Any]:
 # 4. 群体结构统计（大屏"学院对比 / 年级对比"用）
 # =============================================================================
 
-def group_distribution(start: str, end: str, dim: str = "college") -> List[Dict[str, Any]]:
+@ttl_cache
+def group_distribution(start: str, end: str, dim: str = "college", scope: "Scope | None" = None) -> List[Dict[str, Any]]:
     """
     按学院/年级/性别看"人均消费 + 人均学习时长"，同一口径便于横向比较。
     dim 走白名单校验，绝不能把用户输入直接拼进 SQL。
+    隐私：样本量 < STATS_MIN_COHORT 的分组不展示（防小样本反推个人）。
     """
+    from flask import current_app
     col = {"college": "college", "grade": "grade_year", "gender": "gender", "major": "major"}.get(dim)
     if col is None:
         return []
+    wf, wp = _scope_where(scope, col="s.student_id")
     df = _read(
         f"""
         SELECT s.{col} AS dim,
@@ -329,9 +431,10 @@ def group_distribution(start: str, end: str, dim: str = "college") -> List[Dict[
         FROM student s LEFT JOIN consumption c
                ON c.student_id = s.student_id AND c.is_valid = 1
               AND c.consumed_at >= :start AND c.consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE 1=1{wf}
         GROUP BY dim ORDER BY avg_amount DESC
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     lib = _read(
         f"""
@@ -340,11 +443,14 @@ def group_distribution(start: str, end: str, dim: str = "college") -> List[Dict[
         FROM student s LEFT JOIN library_record l
                ON l.student_id = s.student_id AND l.is_valid = 1
               AND l.gate_in_time >= :start AND l.gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE 1=1{wf}
         GROUP BY dim
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     merged = df.merge(lib, on="dim", how="left", suffixes=("", "_lib")).fillna({"hours": 0, "visitors": 0})
+    min_cohort = int(current_app.config.get("STATS_MIN_COHORT", 5))
+    merged = merged[merged["students"] >= min_cohort]      # 小样本分组隐藏
 
     def _label(v: Any) -> str:
         """性别是编码列，直接 str() 会让大屏图例出现 "1"/"2"，须按数据字典翻译回文本"""
@@ -363,18 +469,21 @@ def group_distribution(start: str, end: str, dim: str = "college") -> List[Dict[
     } for _, r in merged.iterrows()]
 
 
-def consumption_rank(start: str, end: str, limit: int = 10, order: str = "desc") -> List[Dict[str, Any]]:
-    """消费金额排行（order=asc 时用于找"疑似经济困难/节食"学生）"""
+@ttl_cache
+def consumption_rank(start: str, end: str, limit: int = 10, order: str = "desc",
+                     scope: "Scope | None" = None) -> List[Dict[str, Any]]:
+    """消费金额排行（含学生姓名，属明细级，须限授权范围）"""
     direction = "ASC" if str(order).lower() == "asc" else "DESC"   # 白名单，不拼用户输入
+    wf, wp = _scope_where(scope, col="c.student_id")
     df = _read(
         f"""
         SELECT c.student_id, s.name, s.college, s.class_name,
                ROUND(SUM(c.amount),2) total, COUNT(*) records, ROUND(AVG(c.amount),2) avg_amount
         FROM consumption c JOIN student s ON s.student_id = c.student_id
-        WHERE c.is_valid = 1 AND c.consumed_at >= :start AND c.consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE c.is_valid = 1 AND c.consumed_at >= :start AND c.consumed_at < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY c.student_id ORDER BY total {direction} LIMIT :limit
         """,
-        {"start": start, "end": end, "limit": int(limit)},
+        {**wp, "start": start, "end": end, "limit": int(limit)},
     )
     return df.replace({np.nan: None}).to_dict(orient="records")
 
@@ -386,108 +495,92 @@ def consumption_rank(start: str, end: str, limit: int = 10, order: str = "desc")
 import datetime as _dt  # noqa: E402  局部导入，避免与上面主体冲突
 
 
-def summary_metrics(start: str, end: str, days: int) -> Dict[str, Any]:
+@ttl_cache
+def summary_metrics(start: str, end: str, days: int, scope: "Scope | None" = None) -> Dict[str, Any]:
     """
-    概览页汇总指标。
-
-    返回字段:
-      window / prev_window   当前窗口与上一环比窗口（字符串 [start, end]）
-      student_count          全库学生数
-      active_rate            窗口内有过消费 OR 进馆的学生占比 (%)
-      total_amount           窗口内消费总额
-      avg_daily_study_minutes  日均图书馆时长（人均，分）
-      warning_count          累计预警总数
-      warning_pending        未处理预警数
-      amount_delta           消费总额环比 (%)，前窗口为 0 时返回 None
-      study_delta            日均在馆时长环比 (%)
-      warning_delta          新增预警环比 (%)
-      active_delta           活跃率环比 (百分点)
-      spark_amount           窗口内每日消费额（小泡图）
-      spark_library          窗口内每日在馆分钟
-      spark_warning          窗口内每日新增预警数
+    概览页汇总指标（均限当前用户数据范围）。
     """
     # ---------- 上一窗口 ----------
     s_dt = _dt.date.fromisoformat(start)
     e_dt = _dt.date.fromisoformat(end)
     prev_s = (s_dt - _dt.timedelta(days=days)).isoformat()
     prev_e = (s_dt - _dt.timedelta(days=1)).isoformat()
+    wf, wp = _scope_where(scope)
 
     # ---------- 当前窗口数据 ----------
-    stu_total = int(_read("SELECT COUNT(*) n FROM student").iloc[0]["n"] or 0)
+    stu_total = int(_read(f"SELECT COUNT(*) n FROM student WHERE 1=1{wf}", wp).iloc[0]["n"] or 0)
 
     cur = _read(
-        """
+        f"""
         SELECT SUM(amount) total_amount,
                COUNT(DISTINCT student_id) active_students
         FROM consumption
-        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     ).iloc[0]
     cur_lib = _read(
-        """
+        f"""
         SELECT ROUND(SUM(stay_minutes) / NULLIF(COUNT(DISTINCT student_id), 0) / :days, 1) avg_daily_min,
                COUNT(DISTINCT student_id) lib_students
         FROM library_record
-        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         """,
-        {"start": start, "end": end, "days": days},
+        {**wp, "start": start, "end": end, "days": days},
     ).iloc[0]
-    warn_row = _read(
-        "SELECT COUNT(*) n, SUM(status=0) pending FROM warning"
-    ).iloc[0]
+    warn_row = _read(f"SELECT COUNT(*) n, SUM(status=0) pending FROM warning WHERE 1=1{wf}", wp).iloc[0]
     new_warn_cur = int(_read(
-        "SELECT COUNT(*) n FROM warning WHERE warning_date >= :start AND warning_date <= :end",
-        {"start": start, "end": end},
+        f"SELECT COUNT(*) n FROM warning WHERE warning_date >= :start AND warning_date <= :end{wf}",
+        {**wp, "start": start, "end": end},
     ).iloc[0]["n"] or 0)
 
     # 当前窗口内有过消费 OR 进馆的学生数（去重）
     active_combined = int(_read(
-        """
+        f"""
         SELECT COUNT(DISTINCT student_id) n FROM (
             SELECT student_id FROM consumption
-            WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+            WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY){wf}
             UNION
             SELECT student_id FROM library_record
-            WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+            WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         ) t
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     ).iloc[0]["n"] or 0)
 
     # ---------- 上一窗口数据（环比） ----------
     prev = _read(
-        """
+        f"""
         SELECT SUM(amount) total_amount,
                COUNT(DISTINCT student_id) active_students
         FROM consumption
-        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         """,
-        {"start": prev_s, "end": prev_e},
+        {**wp, "start": prev_s, "end": prev_e},
     ).iloc[0]
     prev_lib = _read(
-        """
+        f"""
         SELECT ROUND(SUM(stay_minutes) / NULLIF(COUNT(DISTINCT student_id), 0) / :days, 1) avg_daily_min
         FROM library_record
-        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         """,
-        {"start": prev_s, "end": prev_e, "days": days},
+        {**wp, "start": prev_s, "end": prev_e, "days": days},
     ).iloc[0]
     new_warn_prev = int(_read(
-        "SELECT COUNT(*) n FROM warning WHERE warning_date >= :start AND warning_date <= :end",
-        {"start": prev_s, "end": prev_e},
+        f"SELECT COUNT(*) n FROM warning WHERE warning_date >= :start AND warning_date <= :end{wf}",
+        {**wp, "start": prev_s, "end": prev_e},
     ).iloc[0]["n"] or 0)
     prev_active_combined = int(_read(
-        """
+        f"""
         SELECT COUNT(DISTINCT student_id) n FROM (
             SELECT student_id FROM consumption
-            WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+            WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY){wf}
             UNION
             SELECT student_id FROM library_record
-            WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+            WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         ) t
         """,
-        {"start": prev_s, "end": prev_e},
+        {**wp, "start": prev_s, "end": prev_e},
     ).iloc[0]["n"] or 0)
 
     # ---------- 计算占比与环比 ----------
@@ -504,31 +597,31 @@ def summary_metrics(start: str, end: str, days: int) -> Dict[str, Any]:
     # ---------- 小泡图（每日聚合） ----------
     idx = pd.date_range(start=start, end=end, freq="D")
     spark_amount_df = _read(
-        """
+        f"""
         SELECT DATE(consumed_at) d, ROUND(SUM(amount),2) v
         FROM consumption
-        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND consumed_at >= :start AND consumed_at < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY d
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     spark_library_df = _read(
-        """
+        f"""
         SELECT DATE(gate_in_time) d, ROUND(SUM(stay_minutes),0) v
         FROM library_record
-        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY)
+        WHERE is_valid = 1 AND gate_in_time >= :start AND gate_in_time < DATE_ADD(:end, INTERVAL 1 DAY){wf}
         GROUP BY d
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
     spark_warning_df = _read(
-        """
+        f"""
         SELECT warning_date d, COUNT(*) v
         FROM warning
-        WHERE warning_date >= :start AND warning_date <= :end
+        WHERE warning_date >= :start AND warning_date <= :end{wf}
         GROUP BY d
         """,
-        {"start": start, "end": end},
+        {**wp, "start": start, "end": end},
     )
 
     def _spark(df, label_col="v"):

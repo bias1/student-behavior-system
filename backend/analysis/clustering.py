@@ -24,11 +24,12 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import adjusted_rand_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import text
 
 from models import db
+from security import Scope
 
 # 特征定义：key -> (中文名, 单位, 方向说明)。前端图表标签直接用它，保证前后端口径一致
 # 前 4 个是毕设总纲明确要求的特征（归入 core 特征集），后 7 个是细分补充特征
@@ -38,12 +39,12 @@ FEATURES: Dict[str, Dict[str, str]] = {
     "avg_daily_study_minutes": {"label": "日均图书馆时长", "unit": "分钟", "desc": "在馆总分钟 / 窗口天数（未进馆当日计 0）"},
     "meal_time_std":     {"label": "消费时间标准差", "unit": "分钟", "desc": "早/中/晚各餐消费时刻的组内标准差再取均值，越小越规律"},
     "amount_cv":         {"label": "消费波动", "unit": "CV", "desc": "日消费的离散程度，越大越不稳定"},
-    "night_ratio":       {"label": "深夜消费率", "unit": "%", "desc": "23:00-05:00 消费占比，作息紊乱信号"},
+    "night_ratio":       {"label": "深夜消费率", "unit": "%", "desc": "23:00-05:00 消费笔数占比（客观时段分布，不作作息/健康推断）"},
     "meal_reg":          {"label": "三餐规律率", "unit": "%", "desc": "一天内早中晚都出现的比例"},
-    "weekend_ratio":     {"label": "周末消费率", "unit": "%", "desc": "周末消费笔数占比，留校强度代理指标"},
+    "weekend_ratio":     {"label": "周末消费率", "unit": "%", "desc": "周末消费笔数占比（在校时段分布）"},
     "library_days_ratio": {"label": "进馆天数率", "unit": "%", "desc": "统计期内有进馆的天数占比"},
     "avg_stay_minutes":  {"label": "单次在馆时长", "unit": "分钟", "desc": "单次停留时长均值"},
-    "evening_study_ratio": {"label": "晚间进馆率", "unit": "%", "desc": "18 点后进馆占比，夜习型信号"},
+    "evening_study_ratio": {"label": "晚间进馆率", "unit": "%", "desc": "18 点后进馆次数占比"},
 }
 FEATURE_KEYS = list(FEATURES.keys())
 
@@ -63,54 +64,56 @@ def normalize_feature_set(raw: Any) -> str:
 # 簇命名模板：按"特征优势"打分后贪心指派，保证同名不重复分配
 # 权重只用 z 分数的方向，不依赖具体阈值；一行规则对应一类可解释的行为画像
 # sets 声明该规则在哪个特征集下可用：引用列不全时整套跳过，避免"零向量规则"抢注到随机簇上
+# 【红线】标签一律用客观、可验证的行为描述（如"图书馆高频使用型"），
+#   禁止"勤奋/懒惰/贫困/心理异常/作息紊乱"等评价性或健康、经济、心理推断性措辞。
 LABEL_RULES: List[Dict[str, Any]] = [
     # ---------- 仅依赖 core 4 维即可成立的画像 ----------
-    {"label": "图书馆重度用户", "sets": ("core", "full"),
-     "desc": "日均在馆时长远高于均值，学习强度主导画像",
+    {"label": "图书馆高频使用型", "sets": ("core", "full"),
+     "desc": "日均图书馆时长显著高于总体均值，在馆时长主导该群体画像",
      "prefer": {"avg_daily_study_minutes": 1.3, "avg_daily_amount": -0.2, "avg_daily_records": -0.3}},
     {"label": "高消费低频型", "sets": ("core",),
-     "desc": "日均消费高但笔数少，单次金额大（囤货式采购）",
+     "desc": "日均消费金额偏高、日均笔数偏低（单次金额较大）",
      "prefer": {"avg_daily_amount": 1.0, "avg_daily_records": -0.9, "avg_daily_study_minutes": -0.3}},
     {"label": "低消费高频型", "sets": ("core",),
-     "desc": "笔数多但金额低，小额多次消费习惯",
+     "desc": "日均笔数偏高、日均消费金额偏低（小额多次）",
      "prefer": {"avg_daily_records": 1.0, "avg_daily_amount": -0.8, "avg_daily_study_minutes": 0.2}},
-    # 实测中日均金额与日均笔数高度正相关（活跃的人两者都高），
+    # 实测中日均金额与日均笔数高度正相关（两项都高的人较多），
     # 所以"高消费低频型"很少被指派，真正出现的是下面这类"双高"画像——
-    # 缺了这条规则，双高簇会被权重更大的"消费时间不规律型"误抢（见 KEY_MIN_Z 说明）。
+    # 缺了这条规则，双高簇会被权重更大的"消费时段离散型"误抢（见 KEY_MIN_Z 说明）。
     {"label": "高消费高频型", "sets": ("core", "full"),
-     "desc": "日均消费金额与笔数同时偏高，在校消费活跃",
+     "desc": "日均消费金额与笔数同时高于总体均值，在校消费记录密集",
      "prefer": {"avg_daily_amount": 1.0, "avg_daily_records": 1.0,
                 "avg_daily_study_minutes": -0.6}},
-    {"label": "消费时间不规律型", "sets": ("core", "full"),
-     "desc": "三餐时刻离散大（消费时间标准差高），吃饭时间不固定",
+    {"label": "消费时段离散型", "sets": ("core", "full"),
+     "desc": "消费时刻标准差偏高（三餐时间分布离散，客观时段特征）",
      "prefer": {"meal_time_std": 1.3, "avg_daily_study_minutes": -0.3}},
-    {"label": "均衡学习型", "sets": ("core", "full"),
-     "desc": "消费中等且时间规律，在馆时长不低于均值",
+    {"label": "在馆中等·时段集中型", "sets": ("core", "full"),
+     "desc": "日均在馆时长略高于均值、消费时刻较集中、金额与笔数中等",
      "prefer": {"avg_daily_study_minutes": 0.6, "meal_time_std": -0.9,
                 "avg_daily_amount": 0.2, "avg_daily_records": 0.2}},
-    {"label": "低活跃型", "sets": ("core", "full"),
-     "desc": "消费、频次、在馆时长均明显低于均值，需关注",
+    {"label": "行为记录较少型", "sets": ("core", "full"),
+     "desc": "日均消费、笔数、在馆时长均明显低于总体均值（校园卡/门禁记录较少）",
      "prefer": {"avg_daily_amount": -0.8, "avg_daily_records": -0.7,
                 "avg_daily_study_minutes": -1.0, "meal_time_std": 0.4}},
-    # ---------- 需要 full 集的细分作息/行为特征 ----------
-    {"label": "勤奋学习型", "sets": ("full",),
-     "desc": "进馆频繁、日均在馆时长高，消费规律",
+    # ---------- 需要 full 集的细分行为特征 ----------
+    {"label": "进馆高频型", "sets": ("full",),
+     "desc": "进馆天数占比高、日均在馆时长偏高",
      "prefer": {"library_days_ratio": 1.0, "avg_daily_study_minutes": 0.8, "meal_reg": 0.4}},
-    {"label": "作息紊乱型", "sets": ("full",),
-     "desc": "深夜消费明显偏高、晚间自习偏低",
-     # 不用 amount_cv 判"作息紊乱"：消费波动高也可能是突发采购，与作息无关
+    {"label": "深夜消费占比偏高型", "sets": ("full",),
+     "desc": "23:00-05:00 消费笔数占比偏高、18 点后进馆占比偏低（仅时段分布描述，不作作息/健康判断）",
+     # 不用 amount_cv 判"深夜消费"：消费波动高与消费时段无直接关系
      "prefer": {"night_ratio": 1.3, "meal_reg": -0.5, "evening_study_ratio": -0.5}},
-    {"label": "饮食不规律型", "sets": ("full",),
-     "desc": "三餐规律度低（经常漏吃早/中/晚某一餐），但深夜消费并不突出",
+    {"label": "三餐时段覆盖不全型", "sets": ("full",),
+     "desc": "同一天早中晚均出现的比例偏低，深夜消费占比不高（客观餐段覆盖度）",
      "prefer": {"meal_reg": -1.3, "night_ratio": -0.4, "weekend_ratio": 0.3}},
-    {"label": "高消费波动型", "sets": ("full",),
-     "desc": "消费水平与日间波动都明显偏高，含突发大额采购行为",
+    {"label": "消费金额波动偏大型", "sets": ("full",),
+     "desc": "日均消费金额与日消费变异系数均偏高（金额日间离散大）",
      "prefer": {"avg_daily_amount": 1.0, "amount_cv": 0.9, "night_ratio": -0.3}},
-    {"label": "舒适宅居型", "sets": ("full",),
-     "desc": "消费水平偏高、进馆偏低，周末留校强度高",
+    {"label": "周末在校消费偏多型", "sets": ("full",),
+     "desc": "周末消费笔数占比偏高、进馆天数占比偏低",
      "prefer": {"avg_daily_amount": 0.6, "library_days_ratio": -0.9, "weekend_ratio": 0.5}},
-    {"label": "均衡普通型", "sets": ("full",),
-     "desc": "三餐较规律、消费频次略高，其余指标在常规区间内",
+    {"label": "各项接近均值型", "sets": ("full",),
+     "desc": "各行为特征均接近总体均值，无明显偏向",
      "prefer": {"meal_reg": 0.7, "avg_daily_amount": 0.3, "library_days_ratio": 0.3}},
 ]
 
@@ -149,13 +152,14 @@ def describe_cluster(z_row: pd.Series) -> str:
     parts = [f"{FEATURES[fk]['label']}{('显著偏高' if v > 0 else '显著偏低')}"
              f"（{v:+.1f}σ）" for fk, v in items if abs(v) >= KEY_MIN_Z]
     if not parts:
-        return "各项行为特征均接近全校均值，属普通群体"
+        return "各项行为特征均接近全校均值，无明显偏向"
     weak = [fk for fk, v in items if abs(v) < KEY_MIN_Z]
     tail = f"；其余{len(weak)}项接近均值" if weak else ""
     return "、".join(parts[:3]) + tail
 
 _CACHE: Dict[int, Dict[str, Any]] = {}
 _FEAT_CACHE: Dict[tuple, Dict[str, Any]] = {}   # 特征表级缓存：同一窗口的聚类/手肘/群体均值共用
+_MISSING: Dict[tuple, Dict[str, Any]] = {}      # 特征缺失指纹（与 _FEAT_CACHE 同 key）：填补前 NaN 计数 + 样本量
 _LOCK = threading.Lock()
 
 
@@ -214,16 +218,20 @@ def _fetch_daily(start: str, end: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.D
     return cons, lib, meal_std
 
 
-def build_features(start: str, end: str, use_cache: bool = True, ttl: int = 600) -> pd.DataFrame:
+def build_features(start: str, end: str, use_cache: bool = True, ttl: int = 600,
+                   scope: Optional["Scope"] = None) -> pd.DataFrame:
     """
     返回 index=student_id、columns=FEATURE_KEYS 的完整特征表（11 列）。
     分母统一用窗口天数 window_days，保证"没去吃饭/没去图书馆"这些缺失本身也是信号。
     需要子集时由调用方按 FEATURE_SETS 切片，不在这里做分支，保证两套特征数值一致。
-    结果按 (start, end) 做 TTL 缓存（只读约定，调用方只切片/聚合不改原表）：
+    结果按 (start, end, 数据范围指纹) 做 TTL 缓存（只读约定，调用方只切片/聚合不改原表）：
     个体画像一页会碰 fit_kmeans + group_summary 两次，审计发现"注释说复用缓存、
     实际 group_summary 重新扫表"，缓存在这层补齐后两处天然同源。
+    scope 决定"参与建表的学生名册"：名册按授权范围过滤后，下游所有聚合都按 index 对齐，
+    自然把特征矩阵限制在授权学生内；缓存 key 含 scope.key() → 跨数据范围绝不串缓存。
     """
-    key = (start, end)
+    sc = scope if scope is not None else Scope(all=True)
+    key = (start, end, sc.key())
     if use_cache:
         with _LOCK:
             hit = _FEAT_CACHE.get(key)
@@ -234,8 +242,21 @@ def build_features(start: str, end: str, use_cache: bool = True, ttl: int = 600)
                        params={"start": start, "end": end}).iloc[0]["d"]
     window_days = max(1, int(days))
 
-    students = pd.read_sql(text("SELECT student_id FROM student"), con=db.engine)
+    # 学生名册按当前用户数据范围过滤（None/全校=不加限制，空范围=查无学生）
+    wf, wp = sc.sql_filter(col="student_id")
+    students = pd.read_sql(text(f"SELECT student_id FROM student WHERE 1=1{wf}"),
+                           con=db.engine, params=wp)
     df = students.set_index("student_id")
+
+    # 空名册（无任何授权学生）：必须在此短路。否则后续 df[col]=大 Series 会把空 index
+    # 对齐扩展到全体（pandas 对 0 行帧的列赋值会采用右侧索引），造成空范围越权拿到全校特征。
+    if df.index.empty:
+        empty = pd.DataFrame(index=pd.Index([], name="student_id"), columns=FEATURE_KEYS, dtype=float)
+        if use_cache:
+            with _LOCK:
+                _FEAT_CACHE[key] = {"data": empty, "exp": time.time() + ttl}
+                _MISSING[key] = {"counts": {c: 0 for c in FEATURE_KEYS}, "n": 0, "exp": time.time() + ttl}
+        return empty
 
     if len(cons):
         g = cons.groupby("student_id")
@@ -276,12 +297,16 @@ def build_features(start: str, end: str, use_cache: bool = True, ttl: int = 600)
     f["library_days_ratio"] = df["lib_days"] / window_days
     f["avg_stay_minutes"] = df["lib_minutes"] / df["lib_visits"].replace(0, np.nan)
     f["evening_study_ratio"] = df["lib_evening_visits"] / df["lib_visits"].replace(0, np.nan)
+    # 缺失统计（填补前）：比率类特征在学生窗口内无任何消费/进馆时为 NaN（分母为 0）。
+    # 先记下各特征"因缺乏原始记录而无法计算"的人数，供结果透明披露数据完整度（阶段 3 第 7 条）。
+    _miss = {c: int(f[c].isna().sum()) for c in f.columns}
     f = f.fillna(0.0)
 
     # 消费时间标准差：三餐流水不足的学生算不出来（NaN）。
     # 用 0 填会被误读成"极其规律"，用大值填又会被误读成"极度混乱"，
     # 所以用群体中位数填补（不奖不惩），并在论文中说明该处理；全群都缺时兜底 0。
     f["meal_time_std"] = meal_std.set_index("student_id")["meal_time_std"].reindex(f.index)
+    _miss["meal_time_std"] = int(f["meal_time_std"].isna().sum())
     f["meal_time_std"] = f["meal_time_std"].fillna(f["meal_time_std"].median()).fillna(0.0)
 
     # 比率类特征统一换成百分数，前端展示与论文表格更直观
@@ -291,9 +316,11 @@ def build_features(start: str, end: str, use_cache: bool = True, ttl: int = 600)
     if use_cache:
         with _LOCK:
             _FEAT_CACHE[key] = {"data": f[FEATURE_KEYS], "exp": time.time() + ttl}
+            _MISSING[key] = {"counts": _miss, "n": int(len(f)), "exp": time.time() + ttl}
             if len(_FEAT_CACHE) > 16:            # 防止历史窗口组合把内存撑爆
                 oldest = min(_FEAT_CACHE, key=lambda x: _FEAT_CACHE[x]["exp"])
                 _FEAT_CACHE.pop(oldest, None)
+                _MISSING.pop(oldest, None)
     return f[FEATURE_KEYS]
 
 
@@ -348,22 +375,26 @@ def _name_clusters(centers_z: pd.DataFrame,
 
 
 def fit_kmeans(start: str, end: str, k: int = 4, use_cache: bool = True,
-               ttl: int = 600, feature_set: str = DEFAULT_FEATURE_SET) -> Dict[str, Any]:
+               ttl: int = 600, feature_set: str = DEFAULT_FEATURE_SET,
+               scope: Optional["Scope"] = None) -> Dict[str, Any]:
     """
     主入口：返回前端可直接渲染的聚类结果（含簇统计、逐学生归类表、散点坐标、评估指标）。
     feature_set："core"（总纲要求的 4 特征）或 "full"（11 特征），两者共用同一套取数与命名代码。
+    scope：当前用户数据范围。聚类只在授权学生集上构建，缓存 key 含 scope.key()，
+    避免跨学院/跨班级用户复用彼此的聚类结果（审计 S10）。
     """
+    sc = scope if scope is not None else Scope(all=True)
     feature_set = normalize_feature_set(feature_set)
     cols = FEATURE_SETS[feature_set]
     rules = rules_for(feature_set)
-    key = hash((start, end, k, feature_set))         # 特征集不同的缓存必须隔开
+    key = hash((start, end, k, feature_set, sc.key()))   # 特征集/数据范围不同的缓存必须隔开
     if use_cache:
         with _LOCK:
             hit = _CACHE.get(key)
             if hit and time.time() < hit["exp"]:
                 return hit["data"]
 
-    feat = build_features(start, end, use_cache=use_cache).loc[:, cols].dropna()
+    feat = build_features(start, end, use_cache=use_cache, scope=sc).loc[:, cols].dropna()
     if len(feat) < max(3, k):
         return {"error": "样本量不足以聚类", "n_students": int(len(feat)), "k": k,
                 "feature_set": feature_set}
@@ -400,9 +431,10 @@ def fit_kmeans(start: str, end: str, k: int = 4, use_cache: bool = True,
     # 用群体内分位数做映射比 min-max 更稳健（不受极端值拉伸）
     ranks = (feat.rank(pct=True) * 100).round(1)
 
+    wf, wp = sc.sql_filter(col="student_id")
     df_info = pd.read_sql(text(
-        "SELECT student_id, name, college, major, class_name, gender FROM student"),
-        con=db.engine).set_index("student_id")
+        f"SELECT student_id, name, college, major, class_name, gender FROM student WHERE 1=1{wf}"),
+        con=db.engine, params=wp).set_index("student_id")
 
     clusters = []
     for ci in range(k):
@@ -445,6 +477,11 @@ def fit_kmeans(start: str, end: str, k: int = 4, use_cache: bool = True,
         "percentiles": {fk: float(ranks.loc[s, fk]) for fk in cols},
     } for s, l, p in zip(feat.index, labels, coords)]
 
+    # 可追溯性与可解释性增强（阶段 3 第 7/8 条）：算法版本/参数、数据范围指纹、
+    # 种子稳定性、特征缺失率、PCA 分主成分解释度——均与本次拟合同源，写进结果供论文/前端引用
+    stability = _seed_stability(Xs, k, labels)
+    missing_ratio = feature_missing_ratio(start, end, sc)
+
     data = {
         "k": k,
         "feature_set": feature_set,
@@ -456,10 +493,23 @@ def fit_kmeans(start: str, end: str, k: int = 4, use_cache: bool = True,
         "sse": round(float(km.inertia_), 2),        # 论文口径：SSE（簇内误差平方和）= inertia
         "silhouette": sil,                       # 越接近 1 越好；<0.25 说明簇分得不好
         "pca_explained": round(float(sum(pca.explained_variance_ratio_)), 4),
+        "pca_explained_components": [round(float(r), 4) for r in pca.explained_variance_ratio_],
+        "stability_seed_ari": stability,         # 多种子重跑的均值 ARI，越接 1 越稳定
+        "feature_missing": missing_ratio,        # 各特征缺失（无原始记录）人数占比 %
+        "algorithm_version": "KMeans(n_init=10, random_state=42)",
+        "algorithm_params": {"n_clusters": k, "n_init": 10, "random_state": 42,
+                             "scaler": "StandardScaler", "feature_set": feature_set},
+        "scope_key": sc.key(),                   # 授权数据范围指纹（适用范围声明）
+        "data_version": f"window {start}~{end}; n={int(len(feat))}; scope={sc.key()[:48]}",
         "features": {fk: FEATURES[fk] for fk in cols},
         "group_mean": {fk: round(float(feat[fk].mean()), 2) for fk in cols},   # 做"簇 vs 全校"对比表用
         "clusters": clusters,
         "points": points,
+        "disclaimer": (
+            "聚类结果仅用于群体统计与探索，不构成对个体的评价或处分/资助依据；"
+            "消费金额、深夜消费、图书馆使用频率等均为行为代理指标，不能推断心理、健康、经济或学业状况。"
+            "PCA 二维散点仅为可视化投影，其距离不代表高维真实距离。"
+        ),
         "cached_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     if use_cache:
@@ -472,9 +522,11 @@ def fit_kmeans(start: str, end: str, k: int = 4, use_cache: bool = True,
 
 
 def feature_of_student(student_id: str, start: str, end: str, k: int = 4,
-                       feature_set: str = DEFAULT_FEATURE_SET) -> Optional[Dict[str, Any]]:
-    """从缓存的聚类结果里取某个学生的特征与所属簇（个体画像页复用，避免重复算）"""
-    res = fit_kmeans(start, end, k, feature_set=feature_set)
+                       feature_set: str = DEFAULT_FEATURE_SET,
+                       scope: Optional["Scope"] = None) -> Optional[Dict[str, Any]]:
+    """从缓存的聚类结果里取某个学生的特征与所属簇（个体画像页复用，避免重复算）。
+    传 scope 保证：若该生不在当前用户授权范围，fit_kmeans 的名册根本不含他 → 返回 None（防越权画像）。"""
+    res = fit_kmeans(start, end, k, feature_set=feature_set, scope=scope)
     if res.get("error"):
         return None
     for p in res["points"]:
@@ -489,10 +541,11 @@ def feature_of_student(student_id: str, start: str, end: str, k: int = 4,
     return None
 
 
-def group_summary(start: str, end: str, feature_set: str = DEFAULT_FEATURE_SET) -> Dict[str, Any]:
-    """群体各特征均值/中位数，个体画像页用来做"vs 全校平均"对比"""
+def group_summary(start: str, end: str, feature_set: str = DEFAULT_FEATURE_SET,
+                  scope: Optional["Scope"] = None) -> Dict[str, Any]:
+    """群体各特征均值/中位数，个体画像页用来做"vs 全校平均"对比（按授权范围计算）"""
     cols = FEATURE_SETS[normalize_feature_set(feature_set)]
-    feat = build_features(start, end).loc[:, cols]
+    feat = build_features(start, end, scope=scope).loc[:, cols]
     return {
         "feature_set": normalize_feature_set(feature_set),
         "mean": {fk: round(float(feat[fk].mean()), 2) for fk in cols},
@@ -501,18 +554,118 @@ def group_summary(start: str, end: str, feature_set: str = DEFAULT_FEATURE_SET) 
     }
 
 
+def feature_missing_ratio(start: str, end: str, scope: Optional["Scope"] = None) -> Dict[str, float]:
+    """各特征"因缺乏原始记录而无法计算"的人数占比（百分比）。
+    依赖 build_features 在填补前写好的 _MISSING 指纹；无指纹（极端情况）时返回空。"""
+    sc = scope if scope is not None else Scope(all=True)
+    build_features(start, end, scope=sc)                 # 确保缓存与缺失指纹已填充
+    entry = _MISSING.get((start, end, sc.key())) or {}
+    n = int(entry.get("n") or 0)
+    counts = entry.get("counts") or {}
+    if not n:
+        return {}
+    return {c: round(counts.get(c, 0) / n * 100, 2) for c in FEATURE_KEYS}
+
+
+def _seed_stability(Xs: np.ndarray, k: int, labels, seeds: Tuple[int, ...] = (7, 2024)) -> Optional[float]:
+    """聚类稳定性（可复现性证据）：固定数据下换多个随机种子重跑 KMeans，
+    计算与基准解的平均 Adjusted Rand Index。越接1 表示结果对随机初始化越不敏感（越稳定）。
+    仅取两个额外种子（含基准共 3 次拟合），10k×11 量级下代价小于一次完整重算。"""
+    aris: List[float] = []
+    for s in seeds:
+        alt = KMeans(n_clusters=k, n_init=10, random_state=s).fit_predict(Xs)
+        aris.append(float(adjusted_rand_score(labels, alt)))
+    return round(float(np.mean(aris)), 4) if aris else None
+
+
+def fit_kmeans_job(params: Dict[str, Any], scope: "Scope") -> Dict[str, Any]:
+    """
+    异步聚类作业入口（tasks.py 调用）。
+    与直接 API 调用的区别：
+    1. 强制 use_cache=False（异步提交的是显式重算请求）
+    2. 返回摘要（不含逐学生 points 数组），存入 AnalysisJob.result_summary
+    3. 包含算法版本和数据范围说明，实现可追溯
+    """
+    start = str(params.get("start") or "")
+    end   = str(params.get("end")   or "")
+    k     = int(params.get("k", 4))
+    fset  = normalize_feature_set(str(params.get("feature_set", DEFAULT_FEATURE_SET)))
+
+    result = fit_kmeans(start, end, k=k, use_cache=False, feature_set=fset, scope=scope)
+
+    if result.get("error"):
+        raise ValueError(result["error"])
+
+    # 只返回摘要：作业记录不存逐学生明细（内存/数据库体积考虑）
+    return {
+        "k": k,
+        "feature_set": fset,
+        "date_start": result.get("date_start"),
+        "date_end": result.get("date_end"),
+        "n_students": result.get("n_students"),
+        "silhouette": result.get("silhouette"),
+        "inertia": result.get("inertia"),
+        "pca_explained": result.get("pca_explained"),
+        "stability_seed_ari": result.get("stability_seed_ari"),
+        "feature_missing": result.get("feature_missing"),
+        "data_version": result.get("data_version"),
+        "disclaimer": result.get("disclaimer"),
+        "scope_key": scope.key(),
+        "algorithm_version": "KMeans(n_init=10, random_state=42)",
+        "clusters": [
+            {"cluster": c["cluster"], "label": c["label"],
+             "size": c["size"], "pct": c["pct"],
+             "desc": c["desc"], "definition": c["definition"]}
+            for c in result.get("clusters", [])
+        ],
+    }
+
+
+def elbow_curve_job(params: Dict[str, Any], scope: "Scope") -> Dict[str, Any]:
+    """异步手肘法作业入口：返回 K=2..k_max 的 SSE 和轮廓系数曲线摘要"""
+    start = str(params.get("start") or "")
+    end   = str(params.get("end")   or "")
+    k_min = int(params.get("k_min", 2))
+    k_max = int(params.get("k_max", 8))
+    fset  = normalize_feature_set(str(params.get("feature_set", DEFAULT_FEATURE_SET)))
+
+    out = elbow_curve(start, end, k_max=k_max, k_min=k_min,
+                      feature_set=fset, use_cache=False, scope=scope)
+    return {
+        "window": [start, end],
+        "feature_set": fset,
+        "scope_key": scope.key(),
+        "k": out.get("k"),
+        "sse": out.get("sse"),
+        "silhouette": out.get("silhouette"),
+        "n_students": out.get("n_students"),
+        "total_ss": out.get("total_ss"),
+        "algorithm_version": "KMeans(n_init=10, random_state=42)",
+    }
+
+
 def elbow_curve(start: str, end: str, k_max: int = 8, k_min: int = 2,
-                feature_set: str = DEFAULT_FEATURE_SET) -> Dict[str, Any]:
+                feature_set: str = DEFAULT_FEATURE_SET, use_cache: bool = True,
+                ttl: int = 600, scope: Optional["Scope"] = None) -> Dict[str, Any]:
     """
     手肘法选 K：论文"K 值确定"一节的直接证据。
     返回 SSE(inertia) 曲线与轮廓系数曲线；默认 k 从 2 扫到 8（按总纲要求），
     k_min=1 时可取到 SSE 基准点（K=1 时 SSE 即总离差平方和，没有下降可误读）。
+    万人规模下 7 轮 KMeans(n_init=10) 要十几秒，结果只随窗口/特征集变，
+    故与 fit_kmeans 共用 TTL 缓存；key 用元组，与 fit 的 int hash 自然共存。
     """
     feature_set = normalize_feature_set(feature_set)
+    sc = scope if scope is not None else Scope(all=True)
     cols = FEATURE_SETS[feature_set]
     k_min = max(1, min(int(k_min), 8))
     k_max = max(k_min, min(int(k_max), 12))
-    feat = build_features(start, end).loc[:, cols].dropna()
+    key = ("elbow", start, end, k_min, k_max, feature_set, sc.key())
+    if use_cache:
+        with _LOCK:
+            hit = _CACHE.get(key)
+            if hit and time.time() < hit["exp"]:
+                return hit["data"]
+    feat = build_features(start, end, scope=sc).loc[:, cols].dropna()
     Xs = StandardScaler().fit_transform(feat.to_numpy(float))
     out = {"k": [], "inertia": [], "sse": [], "silhouette": []}
     for k in range(k_min, k_max + 1):
@@ -532,4 +685,10 @@ def elbow_curve(start: str, end: str, k_max: int = 8, k_min: int = 2,
     out["feature_keys"] = cols
     # 样本方差总量：SSE 首点与之比就是"解释掉多少变异"，论文里能直接写降幅百分比
     out["total_ss"] = round(float(((Xs - Xs.mean(0)) ** 2).sum()), 2)
+    if use_cache:
+        with _LOCK:
+            _CACHE[key] = {"data": out, "exp": time.time() + ttl}
+            if len(_CACHE) > 32:
+                oldest = min(_CACHE, key=lambda x: _CACHE[x]["exp"])
+                _CACHE.pop(oldest, None)
     return out

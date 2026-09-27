@@ -43,6 +43,16 @@
   --ci-shadow-2: 0 8px 24px rgba(0, 0, 0, 0.45);
   --ci-shadow-pop: 0 16px 48px rgba(0, 0, 0, 0.55);
 
+  /* ---------------- 交互叠加层（深色优先：白叠加提亮；浅色主题整体翻成黑叠加，见 data-theme=light） ---------------- */
+  --ci-hover: rgba(255, 255, 255, 0.05);        /* 行/卡片 hover */
+  --ci-hover-strong: rgba(255, 255, 255, 0.09); /* 更强 hover */
+  --ci-divider: rgba(255, 255, 255, 0.045);     /* 表格行分隔线 */
+  --ci-chip: rgba(255, 255, 255, 0.06);         /* 中性徽标/标签底 */
+  --ci-skeleton: rgba(255, 255, 255, 0.05);     /* 骨架屏微光底 */
+  --ci-scrollbar: rgba(255, 255, 255, 0.12);
+  --ci-scrollbar-hover: rgba(255, 255, 255, 0.2);
+  --ci-sidebar-to: rgba(17, 24, 33, 0.98);      /* 侧栏渐变终点色 */
+
   /* ---------------- 间距（4px 基线） ---------------- */
   --sp-1: 4px;
   --sp-2: 8px;
@@ -57,6 +67,7 @@
   --r-sm: 6px;
   --r-md: 10px;
   --r-lg: 14px;
+  --r-xl: 20px;
   --r-full: 999px;
 
   /* ---------------- 层级 ---------------- */
@@ -80,6 +91,61 @@
   /* ---------------- 字体栈 ---------------- */
   --font-sans: 'Inter Variable', 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
   --font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, 'Inter Variable', monospace;
+}
+
+/* ==========================================================================
+ * 浅色主题（阶段 5）：html[data-theme="light"] 覆盖中性/交互 token。
+ * 数据语义色（青/紫/黄等）作为文字/链接时需在白底上压深以保证对比度；
+ * 图表数据色板仍走 palette.js 的 PALETTE，与 UI 文字色解耦。
+ * ========================================================================== */
+html[data-theme="light"] {
+  --ci-bg: #f3f5f9;
+  --ci-bg-soft: #eceff4;
+  --ci-surface: #ffffff;
+  --ci-surface-2: #eef1f6;
+  --ci-surface-3: #e3e8f0;
+  --ci-glass: rgba(255, 255, 255, 0.72);
+
+  --ci-text: #0f1720;
+  --ci-text-2: #4a5563;
+  --ci-text-3: #8a94a2;
+
+  /* 品牌/语义色：作为文字/描边时压深一档，白底可读 */
+  --ci-primary: #5b4bf0;
+  --ci-primary-soft: rgba(91, 75, 240, 0.12);
+  --ci-primary-dim: rgba(91, 75, 240, 0.10);
+  --ci-cyan: #0e8fc4;
+  --ci-cyan-soft: rgba(14, 143, 196, 0.12);
+  --ci-success: #12a06a;
+  --ci-success-soft: rgba(18, 160, 106, 0.12);
+  --ci-warning: #c9821f;
+  --ci-warning-soft: rgba(201, 130, 31, 0.14);
+  --ci-danger: #e23b5e;
+  --ci-danger-soft: rgba(226, 59, 94, 0.12);
+
+  --ci-border: rgba(15, 23, 32, 0.10);
+  --ci-border-strong: rgba(15, 23, 32, 0.16);
+  --ci-shadow-1: 0 1px 2px rgba(15, 23, 32, 0.08);
+  --ci-shadow-2: 0 8px 24px rgba(15, 23, 32, 0.12);
+  --ci-shadow-pop: 0 16px 48px rgba(15, 23, 32, 0.18);
+
+  /* 交互叠加：白底改用黑叠加（与深色的白叠加语义相反） */
+  --ci-hover: rgba(15, 23, 32, 0.045);
+  --ci-hover-strong: rgba(15, 23, 32, 0.08);
+  --ci-divider: rgba(15, 23, 32, 0.08);
+  --ci-chip: rgba(15, 23, 32, 0.05);
+  --ci-skeleton: rgba(15, 23, 32, 0.06);
+  --ci-scrollbar: rgba(15, 23, 32, 0.18);
+  --ci-scrollbar-hover: rgba(15, 23, 32, 0.28);
+  --ci-sidebar-to: #e9edf3;
+}
+
+/* 浅色底：把 body 的深色辉光背景整体换成低透明品牌辉光 + 浅底 */
+html[data-theme="light"] body {
+  background:
+    radial-gradient(900px 480px at 15% -10%, rgba(91, 75, 240, 0.06), transparent 60%),
+    radial-gradient(1100px 560px at 95% 0%, rgba(14, 143, 196, 0.05), transparent 55%),
+    var(--ci-bg);
 }
 
 * {
@@ -115,11 +181,11 @@ body {
   height: 8px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--ci-scrollbar);
   border-radius: var(--r-full);
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: var(--ci-scrollbar-hover);
 }
 ::-webkit-scrollbar-track {
   background: transparent;

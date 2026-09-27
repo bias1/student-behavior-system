@@ -13,18 +13,21 @@ from flask import Blueprint, request
 
 from analysis import statistics
 from models import MERCHANT_TYPES, WARNING_LEVELS, WARNING_STATUS
+from security import current_scope, require_perm
 from utils import data_range, fail, ok, parse_int, resolve_window
 
 bp = Blueprint("overview", __name__, url_prefix="/api/overview")
 
 
 @bp.get("/")
+@require_perm("stats:read")
 def get_overview():
-    """总览指标：学生数、总消费、日均图书馆时长、预警数、行为高峰"""
-    return ok(statistics.overview())
+    """总览指标：学生数、总消费、日均图书馆时长、预警数、行为高峰（限数据范围）"""
+    return ok(statistics.overview(scope=current_scope()))
 
 
 @bp.get("/summary")
+@require_perm("stats:read")
 def get_summary():
     """
     概览页汇总指标（包含环比/小泡图数据）。
@@ -32,10 +35,11 @@ def get_summary():
     返回: active_rate / total_amount / warning_count / *_delta / spark_* 等
     """
     start, end, days = resolve_window()
-    return ok(statistics.summary_metrics(start, end, days))
+    return ok(statistics.summary_metrics(start, end, days, scope=current_scope()))
 
 
 @bp.get("/groups")
+@require_perm("stats:read")
 def get_groups():
     """
     按维度看群体差异。dim 支持 college / grade / major / gender，
@@ -46,17 +50,20 @@ def get_groups():
         return fail(f"dim 只支持 college/grade/major/gender，收到 {dim}")
     start, end, _ = resolve_window()
     return ok({"dim": dim, "window": [start, end],
-               "items": statistics.group_distribution(start, end, dim)})
+               "items": statistics.group_distribution(start, end, dim, scope=current_scope())})
 
 
 @bp.get("/rank")
+@require_perm("student:detail")
 def get_rank():
-    """消费排行榜：limit 上限 100，order=asc 时给出的是"消费最少"的学生"""
+    """消费排行榜：含学生姓名（明细级），需 student:detail 且限数据范围"""
     start, end, _ = resolve_window()
     limit = parse_int("limit", 10, 1, 100)
-    order = request.args.get("order", "desc")
+    order = (request.args.get("order") or "desc").lower()
+    if order not in ("asc", "desc"):
+        return fail(f"order 只能是 asc 或 desc，收到：{order}")
     return ok({"window": [start, end], "order": order,
-               "items": statistics.consumption_rank(start, end, limit, order)})
+               "items": statistics.consumption_rank(start, end, limit, order, scope=current_scope())})
 
 
 @bp.get("/meta")

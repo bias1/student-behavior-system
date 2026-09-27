@@ -38,7 +38,7 @@ defineProps({
 
 .t-neutral {
   color: var(--ci-text-2);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--ci-chip);
 }
 .t-cyan {
   color: var(--ci-cyan);

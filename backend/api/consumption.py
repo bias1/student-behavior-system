@@ -13,36 +13,40 @@ from __future__ import annotations
 from flask import Blueprint
 
 from analysis import statistics
+from security import current_scope, require_perm
 from utils import ok, resolve_window
 
 bp = Blueprint("consumption", __name__, url_prefix="/api/consumption")
 
 
 @bp.get("/trend")
+@require_perm("stats:read")
 def trend():
     """按天聚合；缺失日期后端已补 0，前端可直接铺折线"""
     start, end, days = resolve_window()
-    data = statistics.consumption_trend(start, end)
+    data = dict(statistics.consumption_trend(start, end, scope=current_scope()))
     data.update({"window": [start, end], "days": days})
     return ok(data)
 
 
 @bp.get("/heatmap")
+@require_perm("stats:read")
 def heatmap():
     """
     热力图数据格式直接对齐 ECharts：data = [[小时, 星期序号, 值], ...]，
     同时给出 max，前端 visualMap 不用再自己算最大值。
     """
     start, end, days = resolve_window()
-    data = statistics.consumption_heatmap(start, end)
+    data = dict(statistics.consumption_heatmap(start, end, scope=current_scope()))
     data.update({"window": [start, end], "days": days})
     return ok(data)
 
 
 @bp.get("/category")
+@require_perm("stats:read")
 def category():
     """类别占比：饼图（商户类型/餐段）+ 条形图（Top 商户）"""
     start, end, days = resolve_window()
-    data = statistics.consumption_category(start, end)
+    data = dict(statistics.consumption_category(start, end, scope=current_scope()))
     data.update({"window": [start, end], "days": days})
     return ok(data)

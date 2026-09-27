@@ -2,22 +2,25 @@ import axios from 'axios'
 import { toast } from '@/components/ui/toast'
 
 /**
- * axios 统一封装
+ * axios 统一封装（阶段 1 生产化改造：Cookie 会话 + 双提交 CSRF）
  *
  * 后端约定（backend/utils.py）：所有响应固定为 { code, data, msg }，
- * 且 HTTP 状态码与 body.code 保持一致。因此这里做三件事：
- * 1. 成功时直接把 data 抛给业务代码，页面里不用再 .data.data 套三层；
- * 2. 业务失败（code != 200）统一弹提示并 reject，页面只需处理"拿到数据"这一条路径；
- * 3. 网络层异常（后端没起、超时、404、500）翻译成中文可读文案。
+ * HTTP 状态码与 body.code 保持一致。
+ *
+ * 会话机制（与 backend/security.py 对齐）：
+ * - 会话令牌存于 httpOnly Cookie（sb_session），浏览器随请求自动发送，JS 无法读取。
+ * - CSRF 令牌存于可读 Cookie（sb_csrf），本模块自动将其写入 X-CSRF-Token 请求头，
+ *   后端守卫对非 GET 请求做双提交比对（库中值 vs 请求头值）。
+ * - axios withCredentials=true 确保跨域请求也携带 Cookie（同源部署时同样有效）。
  *
  * 单次请求可用 config 附加两个自定义开关：
- *   silent: true    不弹全局 toast，由页面自己决定怎么显示（如个体画像的"查无此人"）
+ *   silent: true    不弹全局 toast，由页面自己决定怎么显示
  *   timeout: 60000  聚类首算等慢接口单独放宽超时
  */
 
 const HTTP_TEXT = {
   400: '请求参数有误',
-  401: '登录已过期',
+  401: '登录已过期，请重新登录',
   403: '没有访问权限',
   404: '接口或资源不存在',
   405: '请求方法不被允许',
@@ -38,23 +41,38 @@ function notifyError(msg, type = 'error') {
   setTimeout(() => (notifying = false), 800)
 }
 
-// 登录令牌存储键：后端 auth 守卫开启后，除 /auth/* 外所有接口都要带 Bearer token
-export const TOKEN_KEY = 'sb_token'
-export const getToken = () => localStorage.getItem(TOKEN_KEY) || ''
-export const setToken = (t) => localStorage.setItem(TOKEN_KEY, t)
-export const clearToken = () => localStorage.removeItem(TOKEN_KEY)
+/**
+ * 从 document.cookie 读取 CSRF 令牌（sb_csrf 由后端以非 httpOnly Cookie 下发）。
+ * 与 backend/security.py 中 CSRF_COOKIE = "sb_csrf" 对齐。
+ */
+export function getCsrfToken() {
+  const match = document.cookie.match(/(?:^|[;\s])sb_csrf=([^;]*)/)
+  return match ? decodeURIComponent(match[1]) : ''
+}
+
+/** 清除 CSRF Cookie（401 会话过期时调用；sb_session 是 httpOnly，JS 无法删除，由后端在 /auth/logout 时清除）*/
+function clearCsrfCookie() {
+  // 写入同路径同名但立即过期的 Cookie，兼容有/无 Secure 标志两种情况
+  const secure = location.protocol === 'https:' ? ';Secure' : ''
+  document.cookie = `sb_csrf=;Path=/;Max-Age=0${secure}`
+}
 
 const service = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
   timeout: 20000,
-  // 令牌走 Authorization 头而不是 Cookie，无 CSRF 面，不需要 withCredentials
+  // 会话令牌通过 httpOnly Cookie 传递，axios 需要开启 withCredentials
+  // 才能在跨源（如前端 5173 → 后端 5000 dev server proxy）时携带 Cookie
+  withCredentials: true,
 })
 
 service.interceptors.request.use(
   (cfg) => {
-    // 登录守卫（backend/api/auth.py）：除白名单外一律要求 Bearer token
-    const token = getToken()
-    if (token) cfg.headers.Authorization = `Bearer ${token}`
+    // 非安全方法（POST/PUT/DELETE）须带 CSRF 头（后端守卫对 GET/HEAD/OPTIONS 不检查）
+    const method = (cfg.method || 'get').toUpperCase()
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+      const csrf = getCsrfToken()
+      if (csrf) cfg.headers['X-CSRF-Token'] = csrf
+    }
     return cfg
   },
   (error) => Promise.reject(error)
@@ -85,15 +103,16 @@ service.interceptors.response.use(
     } else if (error.response) {
       const { status, data } = error.response
       msg = data?.msg || HTTP_TEXT[status] || `HTTP ${status}`
-      // 401 = 未登录/过期：清掉本地令牌跳登录页（登录接口自身的 401 是"密码错"，不能跳）
+      // 401 = 会话未携带/已过期/已吊销：清除 CSRF Cookie，全页跳转登录页
+      // （登录接口本身的 401 是"密码错误"，不能跳登录，已在 silent 中处理）
       const isAuthApi = (error.config?.url || '').startsWith('/auth/')
       if (status === 401 && !isAuthApi) {
-        clearToken()
+        clearCsrfCookie()
         if (!window.location.pathname.startsWith('/login')) {
           const redirect = encodeURIComponent(window.location.pathname + window.location.search)
           window.location.href = `/login?redirect=${redirect}`
         }
-        msg = msg || '登录已过期，请重新登录'
+        msg = data?.msg || '登录已过期，请重新登录'
       }
     } else {
       // 没有 response 说明请求没拿到 HTTP 响应：后端未启动 / 代理目标错误 / 网络断开

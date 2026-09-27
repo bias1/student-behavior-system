@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import bindparam, text
 
+from analysis import warning_catalog as cat  # 规则版本/信号分类/指标定义/最小数据量的单一事实源
 from analysis import warning_rules as ext  # 复用已校准的检测函数，不重复实现
 from models import db
 
@@ -50,28 +51,32 @@ SYLLABUS_RULES: Dict[str, Dict[str, Any]] = {
         "threshold_value": 3.00,
         "threshold_json": {"days": 3, "level_high_days": 5},
         "warning_level": 2,
-        "description": "连续 3 天无任何消费记录（>=5 天升级为高），疑似离校、经济困难或卡片异常",
+        "description": "连续 3 天无校园卡消费记录（>=5 天升级为高）；仅为客观消费记录，"
+                       "不等于未进食，可能离校/卡片挂失/数据未采集，需人工核实",
     },
     "CONSUME_DROP": {
-        "rule_name": "本周消费骤降", "warning_type": "consume",
+        "rule_name": "本周消费环比下降", "warning_type": "consume",
         "threshold_value": 0.50,
         "threshold_json": {"ratio": 0.5, "level_high_ratio": 0.25, "min_last_week_amount": 30.0},
         "warning_level": 2,
-        "description": "自然周消费额不足上周 50%（降幅 >=75% 升级为高），且上周消费不低于 30 元",
+        "description": "自然周消费额不足上周 50%（降幅 >=75% 升级为高），且上周消费不低于 30 元；"
+                       "属相对自身变化信号，不推断经济状况，需人工核实",
     },
     "NO_LIBRARY": {
         "rule_name": "长期未进图书馆", "warning_type": "study",
         "threshold_value": 7.00,
         "threshold_json": {"days": 7, "level_high_days": 14},
         "warning_level": 2,
-        "description": "连续 7 天无进馆记录（>=14 天升级为高），学习行为异常",
+        "description": "连续 7 天无进馆记录（>=14 天升级为高）；不等于未学习，"
+                       "可能在其他场所/使用电子资源，需人工核实",
     },
     "NIGHT_WEEK_CONSUME": {
         "rule_name": "夜间消费频发", "warning_type": "health",
         "threshold_value": 5.00,
         "threshold_json": {"start": "23:00", "end": "05:00", "times": 5, "level_high_times": 10},
         "warning_level": 2,
-        "description": "单个自然周内 23:00-05:00 消费超过 5 次（>=10 次升级为高），作息异常",
+        "description": "单个自然周内 23:00-05:00 消费超过 5 次（>=10 次升级为高）；"
+                       "仅为客观频次记录，不推断作息/心理/健康状况，需人工核实",
     },
 }
 
@@ -225,8 +230,8 @@ def rule_no_consume(data: Dict[str, pd.DataFrame], dates: pd.DatetimeIndex, cfg:
             "warning_date": d,                             # 触发日 = 连续段最后一天
             "metric_value": float(run),
             "warning_level": 3 if run >= high_days else 2, # >=high 天为高，其余为中
-            "message": f"{sid} 自 {cnt.columns[di - run + 1].date()} 起已连续 {run} 天无消费记录"
-                       f"（阈值 {days} 天），消费异常",
+            "message": f"{sid} 自 {cnt.columns[di - run + 1].date()} 起已连续 {run} 天无校园卡消费记录"
+                       f"（阈值 {days} 天）；此为客观消费记录，不等于未进食，需人工核实是否离校/挂失/数据缺失",
             "detail": {"streak_days": run, "threshold_days": days,
                        "level_high_days": high_days,
                        "last_consume_date": str(cnt.columns[di - run].date()) if di - run >= 0 else None,
@@ -282,7 +287,7 @@ def rule_consume_drop(data: Dict[str, pd.DataFrame], dates: pd.DatetimeIndex, cf
                 "metric_value": round(ratio, 4),
                 "warning_level": 3 if ratio <= high_ratio else 2,
                 "message": f"{sid} 本周（{cur.date()}~{(cur + pd.Timedelta(days=6)).date()}）消费 {c:.2f} 元，"
-                           f"仅为上周 {p:.2f} 元的 {ratio * 100:.1f}%（降幅 {drop:.1f}%），消费骤降",
+                           f"仅为上周 {p:.2f} 元的 {ratio * 100:.1f}%（降幅 {drop:.1f}%）；相对自身消费变化信号，不推断经济状况，需人工核实",
                 "detail": {"this_week": round(c, 2), "last_week": round(p, 2),
                            "ratio": round(ratio, 4), "drop_pct": round(drop, 2),
                            "this_week_start": str(cur.date()), "last_week_start": str(prev.date()),
@@ -349,7 +354,7 @@ def rule_night_week(data: Dict[str, pd.DataFrame], dates: pd.DatetimeIndex, cfg:
                 "metric_value": float(v),
                 "warning_level": 3 if v >= high_times else 2,
                 "message": f"{sid} 本周（{w.date()} 起）{name} 时段消费 {v} 次"
-                           f"（阈值 >{times} 次），夜间活动频发、作息异常",
+                           f"（阈值 >{times} 次）；仅为客观频次记录，不推断作息/健康，需人工核实",
                 "detail": {"week_times": v, "threshold_times": times, "level_high_times": high_times,
                            "window": name, "week_start": str(w.date())},
             })
@@ -370,22 +375,40 @@ SYLLABUS_FUNCS = {
 
 def _persist(rows: List[Dict[str, Any]]) -> int:
     """
-    幂等写库：唯一键 (student_id, rule_code, warning_date) 冲突时只更新指标/文案/等级，
-    不改 status —— 人工处置过的记录必须留痕，重扫不能把"已处理"冲回"未处理"。
+    幂等写库：唯一键 (student_id, rule_code, warning_date) 冲突时只更新指标/文案/等级
+    与阶段 4 口径快照，不改 status / workflow_state 等工作流列 ——
+    人工处置过的记录必须留痕，重扫不能把"已处理/已核实"冲回初始态。
     """
     if not rows:
         return 0
     sql = text("""
         INSERT INTO warning (student_id, rule_code, rule_name, warning_type, warning_level, warning_date,
-                             metric_value, detail_json, message, status)
+                             metric_value, detail_json, message, status,
+                             rule_version, signal_kind, metric_def, window_start, window_end,
+                             valid_data_days, min_data_days, baseline_ref, data_gap_note,
+                             dedup_key, is_duplicate)
         VALUES (:student_id, :rule_code, :rule_name, :warning_type, :warning_level, :warning_date,
-                :metric_value, :detail_json, :message, 0)
+                :metric_value, :detail_json, :message, 0,
+                :rule_version, :signal_kind, :metric_def, :window_start, :window_end,
+                :valid_data_days, :min_data_days, :baseline_ref, :data_gap_note,
+                :dedup_key, :is_duplicate)
         ON DUPLICATE KEY UPDATE metric_value = VALUES(metric_value),
                                 message = VALUES(message),
                                 detail_json = VALUES(detail_json),
                                 rule_name = VALUES(rule_name),
                                 warning_level = VALUES(warning_level),
-                                warning_type = VALUES(warning_type)
+                                warning_type = VALUES(warning_type),
+                                rule_version = VALUES(rule_version),
+                                signal_kind = VALUES(signal_kind),
+                                metric_def = VALUES(metric_def),
+                                window_start = VALUES(window_start),
+                                window_end = VALUES(window_end),
+                                valid_data_days = VALUES(valid_data_days),
+                                min_data_days = VALUES(min_data_days),
+                                baseline_ref = VALUES(baseline_ref),
+                                data_gap_note = VALUES(data_gap_note),
+                                dedup_key = VALUES(dedup_key),
+                                is_duplicate = VALUES(is_duplicate)
         """)
     payload = []
     for r in rows:
@@ -422,13 +445,14 @@ def scan(start: str, end: str, rules: Optional[List[str]] = None,
     rows: List[Dict[str, Any]] = []
     by_rule: Dict[str, int] = {}
     by_level: Dict[str, int] = {"1": 0, "2": 0, "3": 0}
+    active = cat.student_active_days(data, start, end)      # 每生窗口内有效行为天数（数据缺失门控）
     for code, cfg in cfgs.items():
         hits = SYLLABUS_FUNCS[code](data, dates, cfg)
         by_rule[code] = len(hits)
         for h in hits:
             level = int(h.get("warning_level") or cfg["warning_level"])   # 等级由规则函数按严重程度给定
             by_level[str(level)] = by_level.get(str(level), 0) + 1
-            rows.append({
+            base = {
                 "student_id": h["student_id"], "rule_code": code,
                 # rule_name 随记快照：事后改名/停用不回溯历史预警的展示名（models.to_dict 优先读它）
                 "rule_name": cfg["rule_name"],
@@ -436,8 +460,11 @@ def scan(start: str, end: str, rules: Optional[List[str]] = None,
                 "warning_level": level,
                 "warning_date": h["warning_date"], "metric_value": h.get("metric_value"),
                 "detail": h.get("detail", {}), "message": h["message"][:255],
-            })
+            }
+            valid_days = active.get(str(h["student_id"]))
+            rows.append(cat.enrich_row(base, code, start, end, valid_days))
 
+    cat.mark_duplicates(rows)                               # 同生同规则同窗口只留一条待办，其余标重
     written = _persist(rows) if persist else 0
     return {
         "persisted": persist,

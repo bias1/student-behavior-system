@@ -140,16 +140,17 @@ watch(() => route.params.id, (v) => {
 })
 watch([days, featureSet], load)
 
-onMounted(async () => {
+onMounted(() => {
   sid.value = route.params.id || ''
-  span.value = await dataSpan()
-  let clamped = false
-  if (span.value > 0 && days.value > span.value) { days.value = span.value; clamped = true }
-  await remoteSearch('', false)   // 只预热建议数据，不在加载时弹出下拉
-  if (sid.value) {
-    searchQuery.value = sid.value
-    if (!clamped) load()   // 被钳窗口时 watch(days) 已触发过 load，不重复拉
-  }
+  if (sid.value) searchQuery.value = sid.value
+  // 首屏并行：画像请求与搜索建议预热互不等待，meta 只用于后台修正窗口选项
+  if (sid.value) load()
+  remoteSearch('', false)      // 只预热建议数据，不在加载时弹出下拉
+  dataSpan().then((s) => {
+    span.value = s
+    // 被钳窗口时 watch(days) 会重拉一次，后端同窗口直接命中缓存
+    if (s > 0 && days.value > s) days.value = s
+  })
 })
 
 /* ---------------- KPI 卡片数据 ---------------- */
@@ -184,7 +185,7 @@ const radarOption = computed(() => {
     legend: { bottom: 0, data: ['本人', '全校平均基线'] },
     radar: {
       indicator: inds, radius: '62%', center: ['50%', '46%'],
-      axisName: { color: '#8b96a5', fontSize: 12 },
+      axisName: { fontSize: 12 },  // 颜色交给注册主题（radar.name.textStyle），随深/浅色切换
     },
     series: [{
       type: 'radar',

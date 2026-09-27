@@ -82,7 +82,7 @@ defineProps({
 }
 .v-ghost:hover:not(:disabled) {
   background: var(--ci-surface-3);
-  border-color: rgba(255, 255, 255, 0.22);
+  border-color: var(--ci-border-strong);
 }
 .v-danger {
   background: var(--ci-danger-soft);

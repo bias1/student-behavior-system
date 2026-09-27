@@ -124,7 +124,7 @@ function cellText(col, row) {
 }
 .ci-table td {
   padding: 8px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  border-bottom: 1px solid var(--ci-divider);
   color: var(--ci-text);
   white-space: nowrap;
 }
@@ -135,7 +135,7 @@ function cellText(col, row) {
   transition: background var(--dur-fast) var(--ease);
 }
 .ci-table tbody tr:hover {
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--ci-hover);
 }
 .ci-table tbody tr:last-child td {
   border-bottom: 0;

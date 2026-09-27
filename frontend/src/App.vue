@@ -1,17 +1,20 @@
 <script setup>
 /**
- * 应用外壳：左侧固定导航栏 + 右侧路由视图（Campus Insight 重构版）
+ * 应用外壳：左侧固定导航栏 + 右侧路由视图（Campus Insight 重构版 + 阶段 1 生产化）
  *
  * 设计要点：
  * - 侧栏宽 220px（折叠后 56px），底部可折叠，与主流后台布局一致
  * - 导航图标统一用 lucide-vue-next，不再依赖任何组件库图标
  * - 登录页 isLogin=true 时侧栏与头部均隐藏，内容区占满整个视口
  * - 顶部状态栏展示当前页标题 + 日期 + 用户信息 + 退出，保留旧版时钟逻辑
+ * - 导航项按用户权限过滤：无权项目隐藏，后端保证最终安全
+ * - 会话使用 httpOnly Cookie（useSession 单例），不再使用 localStorage
  */
 import { useRoute, useRouter } from 'vue-router'
-import { computed, onMounted, ref } from 'vue'
-import { AuthApi } from '@/api'
-import { clearToken, getToken } from '@/api/request'
+import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
+import { WarningApi } from '@/api'
+import { useSession } from '@/composables/useSession'
+import { useTheme } from '@/composables/useTheme'
 // lucide 图标：按名称导入，避免全量注入
 import {
   BarChart3,
@@ -20,8 +23,10 @@ import {
   CircuitBoard,
   Command,
   LogOut,
+  Moon,
   Search,
   ShieldAlert,
+  Sun,
   User,
   Users,
 } from 'lucide-vue-next'
@@ -29,15 +34,26 @@ import CommandPalette from '@/components/CommandPalette.vue'
 
 const route = useRoute()
 const router = useRouter()
+const session = useSession()
+const theme = useTheme()
+// 用于模板的别名：展示名优先，否则显示用户名
+const username = computed(() => session.displayName.value || session.username.value)
 
-/* ---------------- 导航列表 ---------------- */
-const NAVS = [
-  { name: 'overview', icon: BarChart3, label: '群体概览', title: '群体概览' },
-  { name: 'students', icon: Users, label: '学生列表', title: '学生列表' },
-  { name: 'student-profile', icon: User, label: '个体画像', title: '个体行为画像' },
-  { name: 'risk', icon: ShieldAlert, label: '风险中心', title: '风险中心' },
-  { name: 'segmentation', icon: CircuitBoard, label: '分群工作台', title: '分群工作台' },
+/* ---------------- 导航列表（全量）---------------- */
+// 每项对应一个权限码；无权项在导航中隐藏（后端 require_perm 确保最终安全）
+const NAVS_ALL = [
+  { name: 'overview',  icon: BarChart3,   label: '群体概览', title: '群体概览',     perm: 'stats:read' },
+  { name: 'students',  icon: Users,       label: '学生列表', title: '学生列表',     perm: 'student:read' },
+  { name: 'student-profile', icon: User,  label: '个体画像', title: '个体行为画像', perm: 'student:detail' },
+  { name: 'risk',      icon: ShieldAlert, label: '风险中心', title: '风险中心',     perm: 'warning:read' },
+  { name: 'segmentation', icon: CircuitBoard, label: '分群工作台', title: '分群工作台', perm: 'clustering:read' },
 ]
+
+// 权限过滤：认证关闭（演示模式）时 hasPerm 全部返回 true，导航全量可见
+const NAVS = computed(() => {
+  if (!session.loggedIn.value) return []   // 未登录时不导航
+  return NAVS_ALL.filter(n => session.hasPerm(n.perm))
+})
 
 const active = computed(() => route.name)
 // 登录页不套导航壳
@@ -60,20 +76,30 @@ function toggleSidebar() {
 /* ---------------- 命令面板 ---------------- */
 const cmdOpen = ref(false)
 
-/* ---------------- 登录状态 ---------------- */
-const username = ref('')
-onMounted(async () => {
-  if (!getToken()) return
+/* ---------------- 登录状态与导航徽标 ---------------- */
+const pendingWarnings = ref(0)
+let warnTimer = null
+
+async function loadPendingWarnings() {
+  if (!session.hasPerm('warning:read')) return   // 无权限时跳过
   try {
-    username.value = (await AuthApi.me()).username || ''
-  } catch {
-    clearToken()
+    const s = await WarningApi.stats({ status: '0' })
+    pendingWarnings.value = s?.total || 0
+  } catch { /* 接口失败静默忽略 */ }
+}
+
+// 会话由路由守卫 bootstrap() 初始化，这里只需加载需会话数据的徽标
+onMounted(() => {
+  if (session.loggedIn.value && session.hasPerm('warning:read')) {
+    loadPendingWarnings()
+    warnTimer = setInterval(loadPendingWarnings, 120000)  // 每 2 分钟刷新
   }
 })
 
-function logout() {
-  clearToken()
-  username.value = ''
+onBeforeUnmount(() => clearInterval(warnTimer))
+
+async function logout() {
+  await session.logout()
   router.push({ name: 'login' })
 }
 
@@ -111,6 +137,14 @@ function go(name) {
         >
           <component :is="n.icon" :size="17" class="nav-icon" />
           <span v-if="!collapsed" class="nav-label">{{ n.label }}</span>
+          <span
+            v-if="n.name === 'risk' && pendingWarnings > 0 && !collapsed"
+            class="nav-badge"
+          >{{ pendingWarnings > 99 ? '99+' : pendingWarnings }}</span>
+          <span
+            v-else-if="n.name === 'risk' && pendingWarnings > 0 && collapsed"
+            class="nav-badge nav-badge--dot"
+          />
         </li>
       </ul>
 
@@ -137,6 +171,20 @@ function go(name) {
       <header v-if="!isLogin" class="app-header">
         <h1 class="header-title">{{ pageTitle }}</h1>
         <div class="header-right sb-muted">
+          <!-- 深/浅主题切换：图标随当前模式翻转 -->
+          <button
+            class="theme-toggle"
+            :title="theme.isLight.value ? '切换到深色' : '切换到浅色'"
+            @click="theme.toggle()"
+          >
+            <Moon v-if="theme.isLight.value" :size="14" />
+            <Sun v-else :size="14" />
+          </button>
+          <!-- 系统状态指示 -->
+          <span class="header-status">
+            <span class="status-dot"></span>
+            <span class="status-text">在线</span>
+          </span>
           <!-- Ctrl+K 命令面板触发 -->
           <button class="header-cmd" @click="cmdOpen = true">
             <Search :size="12" />
@@ -187,11 +235,23 @@ function go(name) {
   width: 220px;
   display: flex;
   flex-direction: column;
-  background: var(--ci-surface);
+  background: linear-gradient(180deg, var(--ci-surface) 0%, var(--ci-sidebar-to) 100%);
   border-right: 1px solid var(--ci-border);
   transition: width 0.22s ease;
   overflow: hidden;
   z-index: 10;
+  position: relative;
+}
+
+.app-sidebar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--ci-primary), var(--ci-cyan));
+  opacity: 0.6;
 }
 
 .app-sidebar.is-collapsed {
@@ -282,10 +342,44 @@ function go(name) {
 
 .nav-icon {
   flex: none;
+  position: relative;
 }
 
 .nav-label {
   flex: 1;
+}
+
+/* 未处理预警角标 */
+.nav-badge {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: var(--r-full);
+  background: var(--ci-danger);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  animation: badge-pulse 2s ease-in-out infinite;
+}
+
+.nav-badge--dot {
+  width: 8px;
+  height: 8px;
+  min-width: 8px;
+  padding: 0;
+  position: absolute;
+  top: -2px;
+  right: -2px;
+}
+
+@keyframes badge-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255,92,124,0.4); }
+  50% { box-shadow: 0 0 0 4px rgba(255,92,124,0); }
 }
 
 /* 侧栏底部 */
@@ -385,8 +479,55 @@ function go(name) {
   color: var(--ci-text-3);
 }
 
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--ci-border);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ci-text-3);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.theme-toggle:hover {
+  border-color: var(--ci-border-strong, rgba(255,255,255,0.14));
+  color: var(--ci-text);
+  background: var(--ci-hover);
+}
+
 .header-clock {
   color: var(--ci-text-3);
+}
+
+/* 系统状态指示 */
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--ci-text-3);
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ci-success);
+  box-shadow: 0 0 6px rgba(55,217,150,0.5);
+  animation: status-pulse 2s ease-in-out infinite;
+}
+
+.status-text {
+  font-size: 11px;
+}
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 
 .header-cmd {

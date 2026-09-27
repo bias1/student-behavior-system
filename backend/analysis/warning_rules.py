@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
+from analysis import warning_catalog as cat  # 阶段 4：规则版本/信号分类/指标定义/去重口径单一事实源
 from models import db
 
 # rule_code -> 大类（与 warning_rule.warning_type 保持一致）
@@ -211,7 +212,8 @@ def rule_low_consume(data: Dict[str, pd.DataFrame], dates: pd.DatetimeIndex, cfg
         base = float(own_n[sid]) if sid in own_n.index else 0.0
         return {"metric_value": round(avg, 2),
                 "message": f"{w.index[0].date()} 起连续 {win} 天每天消费不超过 {max_meals} 笔"
-                           f"（日均 {meals:.1f} 笔、{avg:.1f} 元，本人平时约 {base:.1f} 笔/天），疑似节食或经济困难",
+                           f"（日均 {meals:.1f} 笔、{avg:.1f} 元，本人平时约 {base:.1f} 笔/天）；"
+                           f"消费频次处于个人历史低位，不推断饮食/经济，需人工核实",
                 "detail": {"window_days": win, "max_meals_per_day": max_meals,
                            "meals_per_day": round(meals, 2), "daily_avg": round(avg, 2),
                            "window_total": round(float(w.sum()), 2),
@@ -246,7 +248,8 @@ def rule_night_consume(data: Dict[str, pd.DataFrame], dates: pd.DatetimeIndex, c
         last = last_night.loc[sid].index.max() if len(last_night.loc[sid]) else dates[-1]
         rows.append({"student_id": str(sid), "warning_date": pd.Timestamp(last).date(),
                      "metric_value": round(float(v), 2),
-                     "message": f"{name} 时段累计消费 {int(v)} 次（阈值 {times} 次），作息异常",
+                     "message": f"{name} 时段累计消费 {int(v)} 次（阈值 {times} 次）；"
+                                f"仅为客观频次记录，不推断作息/心理/健康，需人工核实",
                      "detail": {"night_times": int(v), "window": name, "threshold": times}})
     return rows
 
@@ -263,7 +266,8 @@ def rule_meal_irregular(data: Dict[str, pd.DataFrame], dates: pd.DatetimeIndex, 
     hit = rate[rate > rate_thr]
     return [{
         "student_id": str(sid), "warning_date": dates[-1].date(), "metric_value": round(float(v) * 100, 2),
-        "message": f"近 {win} 天缺餐率 {v * 100:.1f}%（阈值 {rate_thr * 100:.0f}%），三餐不规律",
+        "message": f"近 {win} 天早/午/晚餐校园卡覆盖段数偏低（缺餐率 {v * 100:.1f}%，阈值 {rate_thr * 100:.0f}%）；"
+                   f"基于餐段刷卡记录，不等于实际未进食，需人工核实",
         "detail": {"window_days": win, "missing_rate": round(float(v) * 100, 2),
                    "avg_meals": round(float(meals.iloc[:, -win:].mean(axis=1)[sid]), 2)}
     } for sid, v in hit.items()]
@@ -295,7 +299,8 @@ def rule_no_library(data: Dict[str, pd.DataFrame], dates: pd.DatetimeIndex, cfg:
         gap = (dates[-1] - ref).days if ref is not None else len(dates)
         if gap >= days:
             rows.append({"student_id": sid, "warning_date": dates[-1].date(), "metric_value": float(gap),
-                         "message": f"已连续 {gap} 天无进馆记录（阈值 {days} 天），学习行为异常"
+                         "message": f"已连续 {gap} 天无进馆记录（阈值 {days} 天）；不等于未学习，"
+                                    f"可能在其他场所/使用电子资源，需人工核实"
                                     + ("" if in_window or ref is None else f"，末次进馆 {ref.date()}"),
                          "detail": {"gap_days": int(gap), "threshold_days": days,
                                     "last_visit": str(ref.date()) if ref is not None else None}})
@@ -310,7 +315,8 @@ def rule_overstay(data: Dict[str, pd.DataFrame], dates: pd.DatetimeIndex, cfg: D
     def build(sid, d):
         v = float(mins.loc[sid, pd.Timestamp(d)])
         return {"metric_value": round(v / 60, 2),
-                "message": f"{d} 在馆 {v / 60:.1f} 小时（阈值 {hours:.0f} 小时），久坐需提醒",
+                "message": f"{d} 在馆 {v / 60:.1f} 小时（阈值 {hours:.0f} 小时）；"
+                           f"单日在馆时长偏高（可能长时间自习/占座），需人工核实",
                 "detail": {"stay_minutes": round(v, 0), "threshold_hours": hours}}
     return _melt(mask, build)
 
@@ -348,6 +354,7 @@ def scan(start: str, end: str, rules: List[str] | None = None) -> Dict[str, Any]
 
     rows: List[Dict[str, Any]] = []
     by_rule: Dict[str, int] = {}
+    active = cat.student_active_days(data, start, end)      # 数据缺失门控（需求 6）
     for code, fn in RULE_FUNCS.items():
         if code not in rules_cfg or (rules and code not in rules):
             continue
@@ -355,33 +362,57 @@ def scan(start: str, end: str, rules: List[str] | None = None) -> Dict[str, Any]
         by_rule[code] = len(hits)
         tinfo = rules_cfg[code]
         for h in hits:
-            rows.append({
+            base = {
                 "student_id": h["student_id"], "rule_code": code,
                 # 触发时的规则名随记入库，事后改名不回溯历史列表
                 "rule_name": tinfo["rule_name"],
                 "warning_type": tinfo["warning_type"], "warning_level": tinfo["level"],
                 "warning_date": h["warning_date"], "metric_value": h.get("metric_value"),
-                "detail_json": json.dumps(h.get("detail", {}), ensure_ascii=False, default=str),
-                "message": h["message"][:255], "status": 0,
-            })
+                "detail": h.get("detail", {}), "message": h["message"][:255],
+            }
+            rows.append(cat.enrich_row(base, code, start, end, active.get(str(h["student_id"]))))
+
+    cat.mark_duplicates(rows)
 
     written = 0
     if rows:
-        # 唯一键幂等：重复扫描更新指标与文案，已人工处理过的不改状态（保留处置痕迹）
+        # 唯一键幂等：重复扫描更新指标与文案，已人工处理过的不改状态/工作流（保留处置痕迹）
         sql = text("""
             INSERT INTO warning (student_id, rule_code, rule_name, warning_type, warning_level, warning_date,
-                                 metric_value, detail_json, message, status)
+                                 metric_value, detail_json, message, status,
+                                 rule_version, signal_kind, metric_def, window_start, window_end,
+                                 valid_data_days, min_data_days, baseline_ref, data_gap_note,
+                                 dedup_key, is_duplicate)
             VALUES (:student_id, :rule_code, :rule_name, :warning_type, :warning_level, :warning_date,
-                    :metric_value, :detail_json, :message, 0)
+                    :metric_value, :detail_json, :message, 0,
+                    :rule_version, :signal_kind, :metric_def, :window_start, :window_end,
+                    :valid_data_days, :min_data_days, :baseline_ref, :data_gap_note,
+                    :dedup_key, :is_duplicate)
             ON DUPLICATE KEY UPDATE metric_value = VALUES(metric_value),
                                     message = VALUES(message),
                                     detail_json = VALUES(detail_json),
                                     rule_name = VALUES(rule_name),
-                                    warning_level = VALUES(warning_level)
+                                    warning_level = VALUES(warning_level),
+                                    rule_version = VALUES(rule_version),
+                                    signal_kind = VALUES(signal_kind),
+                                    metric_def = VALUES(metric_def),
+                                    window_start = VALUES(window_start),
+                                    window_end = VALUES(window_end),
+                                    valid_data_days = VALUES(valid_data_days),
+                                    min_data_days = VALUES(min_data_days),
+                                    baseline_ref = VALUES(baseline_ref),
+                                    data_gap_note = VALUES(data_gap_note),
+                                    dedup_key = VALUES(dedup_key),
+                                    is_duplicate = VALUES(is_duplicate)
             """)
+        payload = []
+        for r in rows:
+            r = dict(r)
+            r["detail_json"] = json.dumps(r.pop("detail", {}), ensure_ascii=False, default=str)
+            payload.append(r)
         with db.engine.begin() as conn:
-            conn.execute(sql, rows)          # executemany：一次性批量写
-        written = len(rows)
+            conn.execute(sql, payload)         # executemany：一次性批量写
+        written = len(payload)
 
     return {
         "written": written,

@@ -42,5 +42,13 @@ export default defineConfig(({ mode }) => {
         output: { manualChunks: { echarts: ['echarts'] } },
       },
     },
+    // Vitest：与 vite 共用一份配置（含 @ 别名、vue 插件）；
+    // jsdom 环境供组件/组合式测试访问 DOM，globals 关闭以免污染全局（测试里显式 import）
+    test: {
+      environment: 'jsdom',
+      globals: false,
+      include: ['src/**/*.{test,spec}.{js,ts}'],
+      restoreMocks: true,
+    },
   }
 })

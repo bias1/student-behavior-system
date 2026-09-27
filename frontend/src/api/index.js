@@ -64,7 +64,14 @@ export const ClusteringApi = {
   /** 单簇成员（按日均消费降序） */
   members: (params) => http.get('/clustering/members', params),
   /** 扁平归类表：columns + items[{student_id, ..., cluster, label}]，可直接铺表格 */
-  table: (params) => http.get('/clustering/table', params),
+  table: (params, config) => http.get('/clustering/table', params, config),
+  /**
+   * 算法实验（需 clustering:run）：预处理诊断/选 K/稳定性/特征消融/MiniBatch 对照
+   * params: {k, features, k_min, k_max, cap, windows}
+   */
+  experiment: (params, config) => http.get('/clustering/experiment', params, config),
+  /** IsolationForest 独立异常实验（需 clustering:run）：仅聚合分数分布，无个人名单 */
+  iforest: (params, config) => http.get('/clustering/iforest', params, config),
 }
 
 /* ---------------- 预警 /api/warning ---------------- */
@@ -83,17 +90,35 @@ export const WarningApi = {
    * persist=0 只实时计算不落库；rule_code 只重算单条
    */
   refresh: (body) => http.post('/warning/refresh', body || {}),
-  /** 处置：status 0-未处理 1-已处理 2-已忽略 */
+  /** 处置（兼容旧接口）：status 0-未处理 1-已处理 2-已忽略 */
   handle: (id, body) => http.post(`/warning/${id}/handle`, body),
+  /**
+   * 人工核实工作流（需 warning:handle）：
+   * body: { action: 'assign'|'start'|'verify'|'close'|'reopen'|'appeal',
+   *         assigned_to?, verify_result?, verify_note? }
+   * verify_result: need_support | false_positive | data_issue | other
+   */
+  workflow: (id, body) => http.post(`/warning/${id}/workflow`, body),
+  /** 规则级统计：triggered/verified/false_positive/duplicates/data_gap_ratio 等 + 免责（不宣称准确率） */
+  ruleStats: (params) => http.get('/warning/rule-stats', params),
 }
 
-/* ---------------- 认证 /api/auth（轻量登录守卫） ---------------- */
+/* ---------------- 认证 /api/auth（Cookie 会话，阶段 1 生产化） ---------------- */
 export const AuthApi = {
-  /** 登录开关探测（匿名可访问）：enabled=false 时前端不拦路由 */
+  /** 登录开关探测（匿名可访问）：enabled=false 时前端不拦路由，进入演示模式 */
   status: () => http.get('/auth/status', null, { silent: true }),
-  /** 登录：成功返回 {token, expires_in, username, role}，失败 401 */
+  /**
+   * 登录：成功时后端通过 Set-Cookie 下发 httpOnly 会话 Cookie，
+   * 响应体仅含身份信息（username/display_name/roles/permissions），不含令牌。
+   * 失败 401（错误口令）/ 429（账号锁定）/ 403（账号禁用）
+   */
   login: (username, password) => http.post('/auth/login', { username, password }, { silent: true }),
-  /** 回显当前身份（刷新页面时用它恢复登录态） */
+  /**
+   * 登出：吊销当前会话并清除 httpOnly Cookie。
+   * 须带 X-CSRF-Token（request.js 自动处理），无权限时 401。
+   */
+  logout: () => http.post('/auth/logout', {}, { silent: true }),
+  /** 回显当前身份：刷新页面时 useSession.bootstrap() 调用此接口恢复登录态 */
   me: () => http.get('/auth/me', null, { silent: true }),
 }
 
@@ -104,3 +129,16 @@ export const SystemApi = {
 
 /** 预警大类中文映射（后端 warning_type 存英文码）*/
 export const WARNING_TYPE_TEXT = { consume: '消费异常', study: '学习行为', health: '健康作息' }
+
+/** 工作流五态（阶段 4）：预警只是待核实信号，不是结论 */
+export const WORKFLOW_STATE_TEXT = { 0: '待核实', 1: '已分配', 2: '核实中', 3: '已核实', 4: '已关闭' }
+export const WORKFLOW_STATE_TONE = { 0: 'warning', 1: 'cyan', 2: 'primary', 3: 'success', 4: 'neutral' }
+/** 信号五分类（阶段 4） */
+export const SIGNAL_KIND_TEXT = {
+  objective_record: '客观行为记录', personal_change: '相对个人历史变化',
+  data_quality: '数据质量问题', need_verification: '待人工核实信号', confirmed_support: '经核实支持需求',
+}
+/** 核实结论 */
+export const VERIFY_RESULT_TEXT = {
+  need_support: '确认需支持', false_positive: '误报', data_issue: '数据问题', other: '其它',
+}

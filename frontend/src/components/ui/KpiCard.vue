@@ -121,6 +121,6 @@ defineEmits(['click'])
 }
 .kpi__delta.flat {
   color: var(--ci-text-2);
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--ci-chip);
 }
 </style>

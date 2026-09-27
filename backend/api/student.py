@@ -25,9 +25,25 @@ from sqlalchemy.orm import joinedload
 
 from analysis import clustering
 from models import Student, Warning, db
+from security import audit, current_scope, mask_ident, require_perm
 from utils import fail, ok, parse_int, resolve_window
 
 bp = Blueprint("student", __name__, url_prefix="/api/student")
+
+
+def _accessible_student(sid: str):
+    """取学生并校验在当前数据范围内；越权/不存在统一返回 404（防学号枚举）。
+    返回 (student, None) 或 (None, error_response)。"""
+    stu = db.session.get(Student, sid)
+    if stu is None:
+        return None, fail(f"学号 {sid} 不存在", 404)
+    scope = current_scope()
+    if not scope.contains_student_row({
+            "student_id": stu.student_id, "college": stu.college,
+            "class_name": stu.class_name, "grade_year": stu.grade_year}):
+        audit("student_denied", target=mask_ident(sid), detail={"reason": "out_of_scope"}, result="denied")
+        return None, fail(f"学号 {sid} 不存在", 404)      # 与不存在同文案，不暴露“存不在但无权”
+    return stu, None
 
 # 学生窗口内按天聚合：一次查询同时供 KPI、趋势、缺餐率使用
 # night 的区间固定为 23:00-05:00，与预警规则 NIGHT_CONSUME、聚类特征 night_ratio 同一口径
@@ -84,20 +100,43 @@ RADAR_DIMS: Dict[str, tuple] = {
 
 
 @bp.get("/list")
+@require_perm("student:read")
 def student_list():
-    """学生检索：支持学号精确/姓名前缀/学院筛选，个体画像页的搜索框数据源"""
+    """学生检索：支持学号精确/姓名前缀/学院/年级筛选（均限当前用户数据范围）"""
     keyword = (request.args.get("keyword") or "").strip()
     college = request.args.get("college")
+    grade = request.args.get("grade")
     with_stats = request.args.get("with_stats") == "1"
     page, size = parse_int("page", 1, 1, 10000), parse_int("size", 20, 1, 200)
 
+    # 数据范围：空范围直接空结果；非全校则把授权条件下推 SQL（不信任前端 college/grade 参数越权）
+    scope = current_scope()
+    if scope.is_empty():
+        return ok({"total": 0, "page": page, "size": size, "items": [], "reason": "no_data_scope"})
+
     q = Student.query
+    if not scope.all:
+        sc = []
+        if scope.student_ids:
+            sc.append(Student.student_id.in_(list(scope.student_ids)))
+        if scope.colleges:
+            sc.append(Student.college.in_(list(scope.colleges)))
+        if scope.grades:
+            sc.append(Student.grade_year.in_([int(x) for x in scope.grades]))
+        if scope.classes:
+            sc.append(Student.class_name.in_(list(scope.classes)))
+        q = q.filter(db.or_(*sc))
     if keyword:
         # 前缀匹配能走 idx_student_name；% 需转义，避免用户输入把 LIKE 变成全表扫描
         like = keyword.replace("%", r"\%").replace("_", r"\_")
         q = q.filter(db.or_(Student.student_id.like(f"{like}%"), Student.name.like(f"{like}%")))
     if college:
         q = q.filter(Student.college == college)
+    if grade:
+        try:
+            q = q.filter(Student.grade_year == int(grade))
+        except (TypeError, ValueError):
+            return fail(f"参数 grade 必须是整数，收到：{grade}")
     total = q.count()
     rows = q.order_by(Student.student_id).offset((page - 1) * size).limit(size).all()
     items = [s.to_dict() for s in rows]
@@ -145,11 +184,13 @@ def student_list():
 
 
 @bp.get("/<sid>/profile")
+@require_perm("student:detail")
 def profile(sid: str):
-    """个体画像主接口"""
-    stu = db.session.get(Student, sid)
-    if stu is None:
-        return fail(f"学号 {sid} 不存在", 404)
+    """个体画像主接口（需 student:detail 且学生在授权范围内）"""
+    stu, err = _accessible_student(sid)
+    if err:
+        return err
+    audit("student_view", target=sid, detail={"endpoint": "profile"})
 
     start, end, days = resolve_window()
     p = {"sid": sid, "start": start, "end": end}
@@ -181,8 +222,9 @@ def profile(sid: str):
     # ---------- 画像簇与群体分位（复用聚类的缓存结果，不重复训练模型） ----------
     # ?features=core|full 与聚类接口保持一致，否则大屏选 core、画像返 full 会造成簇标签对不上
     fset = clustering.normalize_feature_set(request.args.get("features"))
-    clu = clustering.feature_of_student(sid, start, end, feature_set=fset)
-    summary = clustering.group_summary(start, end, fset)
+    scope = current_scope()
+    clu = clustering.feature_of_student(sid, start, end, feature_set=fset, scope=scope)
+    summary = clustering.group_summary(start, end, fset, scope=scope)
 
     kpi = {
         # 消费维度
@@ -262,10 +304,12 @@ def profile(sid: str):
 
 
 @bp.get("/<sid>/consumption")
+@require_perm("student:detail")
 def consumption_detail(sid: str):
-    """消费流水明细（分页表格）；page/size 上限做保护，避免一次拉空表"""
-    if db.session.get(Student, sid) is None:
-        return fail(f"学号 {sid} 不存在", 404)
+    """消费流水明细（分页表格）；需 student:detail，学号越权/不存在统一 404"""
+    _, err = _accessible_student(sid)
+    if err:
+        return err
     start, end, _ = resolve_window()
     page, size = parse_int("page", 1, 1, 10000), parse_int("size", 20, 1, 200)
     df = pd.read_sql(text("""
@@ -292,10 +336,12 @@ def consumption_detail(sid: str):
 
 
 @bp.get("/<sid>/library")
+@require_perm("student:detail")
 def library_detail(sid: str):
-    """进馆记录明细（分页表格），含自动计算出的停留时长"""
-    if db.session.get(Student, sid) is None:
-        return fail(f"学号 {sid} 不存在", 404)
+    """进馆记录明细（分页表格）；需 student:detail，学号越权/不存在统一 404"""
+    _, err = _accessible_student(sid)
+    if err:
+        return err
     start, end, _ = resolve_window()
     page, size = parse_int("page", 1, 1, 10000), parse_int("size", 20, 1, 200)
     df = pd.read_sql(text("""
